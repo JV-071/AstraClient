@@ -222,11 +222,16 @@ endif()
 
 # process options
 if(USE_STATIC_LIBS)
-        if(NOT APPLE)
+        if(NOT APPLE AND NOT MSVC)
             set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -static-libgcc -static-libstdc++")
         endif()
         message(STATUS "Link to static libraries: ON")
-        set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+        if(MSVC)
+            # No MSVC as libs do vcpkg sao .lib (nao .a) -> sem isso os find_library quebram
+            set(CMAKE_FIND_LIBRARY_SUFFIXES ".lib" ".a")
+        else()
+            set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+        endif()
 else()
         message(STATUS "Link to static libraries: OFF")
 endif()
