@@ -284,7 +284,11 @@ if(NOT WASM)
     )
 
     if(WIN32)
-        set(framework_LIBRARIES ${framework_LIBRARIES} -lbcrypt -ldbghelp -lshlwapi -liphlpapi -lpsapi)
+        if(MSVC)
+            set(framework_LIBRARIES ${framework_LIBRARIES} bcrypt dbghelp shlwapi iphlpapi psapi)
+        else()
+            set(framework_LIBRARIES ${framework_LIBRARIES} -lbcrypt -ldbghelp -lshlwapi -liphlpapi -lpsapi)
+        endif()
     endif()
 
     set(framework_INCLUDE_DIRS ${framework_INCLUDE_DIRS}
