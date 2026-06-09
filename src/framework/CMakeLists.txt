@@ -158,8 +158,10 @@ set(framework_SOURCES ${framework_SOURCES}
     ${CMAKE_CURRENT_LIST_DIR}/platform/platform.h
 )
 
-set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/luafunctions.cpp
-                            PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-g0 -Os")
+if(NOT MSVC)
+    set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/luafunctions.cpp
+                                PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-g0 -Os")
+endif()
 
 # some build options
 option(LUAJIT "Use lua jit" ON)
@@ -202,6 +204,9 @@ if(WASM)
     set_source_files_properties(${LUA_SRC} PROPERTIES LANGUAGE CXX )
     set(framework_SOURCES ${framework_SOURCES} ${LUA_SRC})
     message(STATUS "LUA: " ${LUA_SRC})
+elseif(MSVC)
+    # MSVC: usar os defaults do CMake (/EHsc /GR /O2 ...); as flags GCC abaixo nao valem aqui
+    set(CMAKE_CXX_FLAGS_RELEASE           "/O2 /DNDEBUG")
 else()
     set(CMAKE_CXX_FLAGS                   "${CMAKE_CXX_FLAGS} ${WARNS_FLAGS} ${ARCH_FLAGS} -pipe")
     set(CMAKE_CXX_FLAGS_COMPILESPEED      "-O0")
@@ -338,7 +343,9 @@ if(USE_LIBCPP)
 endif()
 
 if(WIN32)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mthreads")
+    if(NOT MSVC)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mthreads")
+    endif()
     set(framework_DEFINITIONS ${framework_DEFINITIONS} -D_WIN32_WINNT=0x0501 -DWIN32)
     #set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -Wl,--large-address-aware") # strip all debug information
     set(SYSTEM_LIBRARIES "")
