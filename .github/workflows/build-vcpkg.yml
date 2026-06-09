@@ -35,27 +35,19 @@ jobs:
     runs-on: windows-2022
 
     env:
-      VCPKG_BUILD_TYPE: release
-      VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed/x64-windows-static-release
+      # Cache binario das deps do vcpkg (re-runs restauram boost/angle/glew prontos).
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_cache
-      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_cache,readwrite
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg_cache,readwrite"
 
     steps:
       - uses: actions/checkout@v4
 
-      # Forca o ambiente MSVC: o runner tem MinGW no PATH, o que fazia o vcpkg
-      # nao achar o compilador (CMAKE_C_COMPILER not set) ao buildar portas (glew).
-      - name: Setup MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+      - name: Get latest CMake
+        uses: lukka/get-cmake@v4.3.2
 
       - name: Create vcpkg binary cache directory
         run: mkdir -p "${{ github.workspace }}/vcpkg_cache"
         shell: bash
-
-      - name: Get latest CMake
-        uses: lukka/get-cmake@v4.3.2
 
       - name: Cache vcpkg binary packages
         uses: actions/cache@v4
@@ -64,21 +56,18 @@ jobs:
           key: vcpkg-windows-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', '**/CMakeLists.txt') }}
           restore-keys: |
             vcpkg-windows-
-      - name: Run vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgJsonGlob: 'vcpkg.json'
 
-      - name: Configure CMake
-        run: >
-          cmake -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_C_COMPILER=cl
-          -DCMAKE_CXX_COMPILER=cl
-          -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
-
-      - name: Build
-        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
+      # cmd + vcvars64: garante o ambiente MSVC completo nos subprocessos que o
+      # vcpkg dispara pra buildar as portas (glew falhava com 'CMAKE_C_COMPILER not
+      # set' quando o ambiente era so exportado via msvc-dev-cmd + cmake cru).
+      - name: Setup MSVC, build vcpkg deps and AstraClient
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if not exist vcpkg git clone https://github.com/microsoft/vcpkg vcpkg
+          call vcpkg\bootstrap-vcpkg.bat
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_TOOLCHAIN_FILE=%GITHUB_WORKSPACE%\vcpkg\scripts\buildsystems\vcpkg.cmake
+          cmake --build build --parallel %NUMBER_OF_PROCESSORS%
 
       - name: Upload build logs
         uses: actions/upload-artifact@v4
