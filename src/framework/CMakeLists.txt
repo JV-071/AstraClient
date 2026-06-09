@@ -297,9 +297,9 @@ if(NOT WASM)
 
     if(WIN32)
         if(MSVC)
-            set(framework_LIBRARIES ${framework_LIBRARIES} bcrypt dbghelp shlwapi iphlpapi psapi)
+            set(framework_LIBRARIES ${framework_LIBRARIES} bcrypt dbghelp shlwapi iphlpapi psapi winmm)
         else()
-            set(framework_LIBRARIES ${framework_LIBRARIES} -lbcrypt -ldbghelp -lshlwapi -liphlpapi -lpsapi)
+            set(framework_LIBRARIES ${framework_LIBRARIES} -lbcrypt -ldbghelp -lshlwapi -liphlpapi -lpsapi -lwinmm)
         endif()
     endif()
 
