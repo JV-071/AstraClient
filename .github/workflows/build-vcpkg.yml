@@ -35,9 +35,9 @@ jobs:
     runs-on: windows-2022
 
     env:
-      # Cache binario das deps do vcpkg (re-runs restauram boost/angle/glew prontos).
-      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_cache
-      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg_cache,readwrite"
+      # Cache binario das deps via GitHub Actions cache (x-gha): salva cada pacote
+      # na hora, inclusive quando a run FALHA -> iteracoes rapidas durante o grinding.
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
     steps:
       - uses: actions/checkout@v4
@@ -45,17 +45,12 @@ jobs:
       - name: Get latest CMake
         uses: lukka/get-cmake@v4.3.2
 
-      - name: Create vcpkg binary cache directory
-        run: mkdir -p "${{ github.workspace }}/vcpkg_cache"
-        shell: bash
-
-      - name: Cache vcpkg binary packages
-        uses: actions/cache@v4
+      - name: Export GitHub Actions cache env (vcpkg x-gha)
+        uses: actions/github-script@v7
         with:
-          path: ${{ github.workspace }}/vcpkg_cache
-          key: vcpkg-windows-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', '**/CMakeLists.txt') }}
-          restore-keys: |
-            vcpkg-windows-
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       # cmd + vcvars64: garante o ambiente MSVC completo nos subprocessos que o
       # vcpkg dispara pra buildar as portas (glew falhava com 'CMAKE_C_COMPILER not
