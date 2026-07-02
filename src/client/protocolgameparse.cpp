@@ -631,6 +631,9 @@ void ProtocolGame::parseMessage(const InputMessagePtr& msg)
             case Proto::GameServerLootContainers:
                 parseLootContainers(msg);
                 break;
+            case Proto::GameServerStanceProtocol:
+                parseStanceProtocol(msg);
+                break;
             case Proto::GameServerSupplyStash:
                 parseSupplyStash(msg);
                 break;
@@ -3837,6 +3840,36 @@ void ProtocolGame::parseLootContainers(const InputMessagePtr& msg)
 
     g_lua.callGlobalField("g_game", "onParseLootContainers", quickLootFallbackToMainContainer ? 1 : 0, lootContainers, obtainContainers);
     g_lua.callGlobalField("g_game", "onQuickLootContainers", quickLootFallbackToMainContainer, lootList);
+}
+
+void ProtocolGame::parseStanceProtocol(const InputMessagePtr& msg)
+{
+    int unreadSize = msg->getUnreadSize();
+    if (unreadSize < 2) {
+        if (unreadSize > 0)
+            msg->skipBytes(static_cast<uint32_t>(unreadSize));
+        return;
+    }
+
+    const uint8_t action = msg->getU8();
+    const uint8_t count = msg->getU8();
+    const int requiredBytes = static_cast<int>(count) * 2;
+
+    unreadSize = msg->getUnreadSize();
+    if (unreadSize < requiredBytes) {
+        if (unreadSize > 0)
+            msg->skipBytes(static_cast<uint32_t>(unreadSize));
+        return;
+    }
+
+    std::vector<uint16_t> spellIds;
+    spellIds.reserve(count);
+
+    for (uint8_t i = 0; i < count; ++i) {
+        spellIds.emplace_back(msg->getU16());
+    }
+
+    g_lua.callGlobalField("g_game", "updateStanceProtocol", action, spellIds);
 }
 
 void ProtocolGame::parseSupplyStash(const InputMessagePtr& msg)
