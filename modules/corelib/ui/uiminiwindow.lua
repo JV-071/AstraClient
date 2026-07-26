@@ -69,12 +69,10 @@ function UIMiniWindow:close()
       end
   end
 
-  if self:getId():find("container") then
-    g_game.doThing(false)
-    g_game.close(self.container)
-    g_game.doThing(true)
-  elseif self:getId():find("PartyWindow") then
-    modules.game_sidebuttons.setButtonVisible("partyWidget", false)
+  if self:getId():find("PartyWindow") then
+    if modules.game_sidebuttons then
+      modules.game_sidebuttons.setButtonVisible("partyWidget", false)
+    end
   elseif self:getId() == "lockerSearchWindow" then
     modules.game_search_locker.toggleSearchFocus()
   end
