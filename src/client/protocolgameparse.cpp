@@ -2100,8 +2100,6 @@ void ProtocolGame::parsePlayerInfo(const InputMessagePtr& msg)
     for (int i = 0; i < spellCount; ++i)
         spells.push_back(msg->getU16()); // custom spell ids exceed 255
 
-    msg->getU8(); // magic shield active
-
     m_localPlayer->setPremium(premium);
     m_localPlayer->setVocation(vocation);
     m_localPlayer->setSpells(spells);
