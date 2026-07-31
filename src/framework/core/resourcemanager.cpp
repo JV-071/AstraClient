@@ -47,6 +47,16 @@
 
 ResourceManager g_resources;
 static const std::string INIT_FILENAME = "init.lua";
+static constexpr size_t MAX_ENCRYPTED_PAYLOAD_SIZE = 512ULL * 1024 * 1024;
+static constexpr size_t ENC3_HEADER_SIZE = 24;
+
+static bool canEncryptPayload(size_t payloadSize)
+{
+    if (payloadSize > MAX_ENCRYPTED_PAYLOAD_SIZE)
+        return false;
+    return static_cast<size_t>(compressBound(static_cast<uLong>(payloadSize))) <=
+           MAX_ENCRYPTED_PAYLOAD_SIZE - ENC3_HEADER_SIZE;
+}
 
 void ResourceManager::init(const char *argv0)
 {
@@ -325,8 +335,8 @@ bool ResourceManager::loadDataFromSelf(bool unmountIfMounted) {
     file.close();
     for (size_t i = 0, end = size - 128; i < end; ++i) {
         if (v[i] == 0x50 && v[i + 1] == 0x4b && v[i + 2] == 0x03 && v[i + 3] == 0x04 && v[i + 4] == 0x14) {
-            uint32_t compSize = *(uint32_t*)&v[i + 18];
-            uint32_t decompSize = *(uint32_t*)&v[i + 22];
+            uint32_t compSize = stdext::readULE32(&v[i + 18]);
+            uint32_t decompSize = stdext::readULE32(&v[i + 22]);
             if (compSize < 1024 * 1024 * 512 && decompSize < 1024 * 1024 * 512) {
                 data = std::make_shared<std::vector<uint8_t>>(&v[i], &v[v.size() - 1]);
                 break;
@@ -388,9 +398,18 @@ std::string ResourceManager::readFileContents(const std::string& fileName, bool 
     if(!file)
         stdext::throw_exception(stdext::format("unable to open file '%s': %s", fullPath, PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode())));
 
-    int fileSize = PHYSFS_fileLength(file);
-    std::string buffer(fileSize, 0);
-    PHYSFS_readBytes(file, (void*)&buffer[0], fileSize);
+    const PHYSFS_sint64 fileSize = PHYSFS_fileLength(file);
+    constexpr PHYSFS_sint64 MAX_RESOURCE_SIZE = 512LL * 1024 * 1024;
+    if (fileSize < 0 || fileSize > MAX_RESOURCE_SIZE) {
+        PHYSFS_close(file);
+        stdext::throw_exception(stdext::format("invalid file size for '%s'", fullPath));
+    }
+
+    std::string buffer(static_cast<size_t>(fileSize), 0);
+    if (fileSize > 0 && PHYSFS_readBytes(file, buffer.data(), fileSize) != fileSize) {
+        PHYSFS_close(file);
+        stdext::throw_exception(stdext::format("unable to read file '%s'", fullPath));
+    }
     PHYSFS_close(file);
 
     if (safe) {
@@ -429,17 +448,26 @@ bool ResourceManager::isFileEncryptedOrCompressed(const std::string& fileName)
             if (dfile->body.size() < 10)
                 return false;
             fileContent = std::string(dfile->body.begin(), dfile->body.begin() + 10);
-        }
+        } else
+            return false;
     }
 
-    if (!fileContent.empty()) {
+    if (fileContent.empty()) {
         PHYSFS_File* file = PHYSFS_openRead(fullPath.c_str());
         if (!file)
             stdext::throw_exception(stdext::format("unable to open file '%s': %s", fullPath, PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode())));
 
-        int fileSize = std::min<int>(10, PHYSFS_fileLength(file));
+        const PHYSFS_sint64 fileLength = PHYSFS_fileLength(file);
+        if (fileLength < 0) {
+            PHYSFS_close(file);
+            return false;
+        }
+        const size_t fileSize = static_cast<size_t>(std::min<PHYSFS_sint64>(10, fileLength));
         fileContent.resize(fileSize);
-        PHYSFS_readBytes(file, (void*)&fileContent[0], fileSize);
+        if (fileSize > 0 && PHYSFS_readBytes(file, fileContent.data(), fileSize) != fileSize) {
+            PHYSFS_close(file);
+            return false;
+        }
         PHYSFS_close(file);
     }
 
@@ -598,9 +626,17 @@ std::string ResourceManager::fileChecksum(const std::string& path) {
     if(!file)
         return "";
 
-    int fileSize = PHYSFS_fileLength(file);
-    std::string buffer(fileSize, 0);
-    PHYSFS_readBytes(file, (void*)&buffer[0], fileSize);
+    const PHYSFS_sint64 fileSize = PHYSFS_fileLength(file);
+    constexpr PHYSFS_sint64 MAX_CHECKSUM_FILE_SIZE = 512LL * 1024 * 1024;
+    if (fileSize < 0 || fileSize > MAX_CHECKSUM_FILE_SIZE) {
+        PHYSFS_close(file);
+        return "";
+    }
+    std::string buffer(static_cast<size_t>(fileSize), 0);
+    if (fileSize > 0 && PHYSFS_readBytes(file, buffer.data(), fileSize) != fileSize) {
+        PHYSFS_close(file);
+        return "";
+    }
     PHYSFS_close(file);
 
     auto checksum = g_crypt.crc32(buffer, false);
@@ -993,6 +1029,18 @@ void ResourceManager::encrypt(const std::string& seed) {
     while (!toEncrypt.empty()) {
         auto it = toEncrypt.front();
         toEncrypt.pop();
+
+        std::error_code fileSizeError;
+        const auto fileSize = std::filesystem::file_size(it, fileSizeError);
+        if (fileSizeError) {
+            g_logger.error(stdext::format("%s - unable to determine file size", it.string()));
+            continue;
+        }
+        if (fileSize > MAX_ENCRYPTED_PAYLOAD_SIZE) {
+            g_logger.error(stdext::format("%s - exceeds the 512 MiB encryption limit", it.string()));
+            continue;
+        }
+
         std::ifstream in_file(it, std::ios::binary);
         if (!in_file.is_open())
             continue;
@@ -1011,6 +1059,11 @@ void ResourceManager::encrypt(const std::string& seed) {
             }
         }
 
+        if (!canEncryptPayload(buffer.size())) {
+            g_logger.error(stdext::format("%s - exceeds the 512 MiB encryption limit", it.string()));
+            continue;
+        }
+
         if (!encryptBuffer(buffer, uintseed)) { // already encrypted
             g_logger.info(stdext::format("%s - already encrypted", it.string()));
             continue;
@@ -1027,29 +1080,37 @@ void ResourceManager::encrypt(const std::string& seed) {
 #endif 
 
 bool ResourceManager::decryptBuffer(std::string& buffer) {
-    if (buffer.size() < 5)
+    if (buffer.size() < 4)
         return true;
 
     if (buffer.substr(0, 4).compare("ENC3") != 0) {
         return false;
     }
 
-    uint64_t key = *(uint64_t*)&buffer[4];
-    uint32_t compressed_size = *(uint32_t*)&buffer[12];
-    uint32_t size = *(uint32_t*)&buffer[16];
-    uint32_t adler = *(uint32_t*)&buffer[20];
-
-    if (compressed_size < buffer.size() - 24)
+    if (buffer.size() < ENC3_HEADER_SIZE)
         return false;
 
-    g_crypt.bdecrypt((uint8_t*)&buffer[24], compressed_size, key);
+    const auto* header = reinterpret_cast<const uint8_t*>(buffer.data());
+    const uint64_t key = stdext::readULE64(header + 4);
+    const uint32_t compressed_size = stdext::readULE32(header + 12);
+    const uint32_t size = stdext::readULE32(header + 16);
+    const uint32_t adler = stdext::readULE32(header + 20);
+    if (compressed_size == 0 ||
+        compressed_size > MAX_ENCRYPTED_PAYLOAD_SIZE ||
+        compressed_size > buffer.size() - ENC3_HEADER_SIZE ||
+        size > MAX_ENCRYPTED_PAYLOAD_SIZE)
+        return false;
+
+    g_crypt.bdecrypt((uint8_t*)&buffer[ENC3_HEADER_SIZE], compressed_size, key);
     std::string new_buffer;
     new_buffer.resize(size);
     unsigned long new_buffer_size = new_buffer.size();
-    if (uncompress((uint8_t*)new_buffer.data(), &new_buffer_size, (uint8_t*)&buffer[24], compressed_size) != Z_OK)
+    if (uncompress(reinterpret_cast<uint8_t*>(new_buffer.data()), &new_buffer_size,
+                   reinterpret_cast<uint8_t*>(&buffer[ENC3_HEADER_SIZE]), compressed_size) != Z_OK ||
+        new_buffer_size != size)
         return false;
 
-    uint32_t addlerCheck = stdext::adler32((const uint8_t*)&new_buffer[0], size);
+    uint32_t addlerCheck = stdext::adler32(reinterpret_cast<const uint8_t*>(new_buffer.data()), size);
     if (adler != addlerCheck) {
         uint32_t cseed = adler ^ addlerCheck;
         if (m_customEncryption == 0) {
@@ -1066,33 +1127,37 @@ bool ResourceManager::decryptBuffer(std::string& buffer) {
 
 #ifdef WITH_ENCRYPTION
 bool ResourceManager::encryptBuffer(std::string& buffer, uint32_t seed) {
+    if (!canEncryptPayload(buffer.size()))
+        return false;
+
     if (buffer.size() >= 4 && buffer.substr(0, 4).compare("ENC3") == 0)
         return false; // already encrypted
 
     // not random beacause it would require to update to new files each time
-    int64_t key = stdext::adler32((const uint8_t*)&buffer[0], buffer.size());
+    int64_t key = stdext::adler32(reinterpret_cast<const uint8_t*>(buffer.data()), buffer.size());
     key <<= 32;
-    key += stdext::adler32((const uint8_t*)&buffer[0], buffer.size() / 2);
+    key += stdext::adler32(reinterpret_cast<const uint8_t*>(buffer.data()), buffer.size() / 2);
 
-    std::string new_buffer(24 + buffer.size() * 2, '0');
+    unsigned long dstLen = compressBound(static_cast<uLong>(buffer.size()));
+    std::string new_buffer(ENC3_HEADER_SIZE + static_cast<size_t>(dstLen), '0');
     new_buffer[0] = 'E';
     new_buffer[1] = 'N';
     new_buffer[2] = 'C';
     new_buffer[3] = '3';
 
-    unsigned long dstLen = new_buffer.size() - 24;
-    if (compress((uint8_t*)&new_buffer[24], &dstLen, (const uint8_t*)buffer.data(), buffer.size()) != Z_OK) {
+    if (compress((uint8_t*)&new_buffer[ENC3_HEADER_SIZE], &dstLen, (const uint8_t*)buffer.data(), buffer.size()) != Z_OK) {
         g_logger.error("Error while compressing");
         return false;
     }
-    new_buffer.resize(24 + dstLen);
+    new_buffer.resize(ENC3_HEADER_SIZE + dstLen);
 
-    *(int64_t*)&new_buffer[4] = key;
-    *(uint32_t*)&new_buffer[12] = (uint32_t)dstLen;
-    *(uint32_t*)&new_buffer[16] = (uint32_t)buffer.size();
-    *(uint32_t*)&new_buffer[20] = ((uint32_t)stdext::adler32((const uint8_t*)&buffer[0], buffer.size())) ^ seed;
+    auto* header = reinterpret_cast<uint8_t*>(new_buffer.data());
+    stdext::writeULE64(header + 4, static_cast<uint64_t>(key));
+    stdext::writeULE32(header + 12, static_cast<uint32_t>(dstLen));
+    stdext::writeULE32(header + 16, static_cast<uint32_t>(buffer.size()));
+    stdext::writeULE32(header + 20, stdext::adler32(reinterpret_cast<const uint8_t*>(buffer.data()), buffer.size()) ^ seed);
 
-    g_crypt.bencrypt((uint8_t*)&new_buffer[0] + 24, new_buffer.size() - 24, key);
+    g_crypt.bencrypt((uint8_t*)&new_buffer[0] + ENC3_HEADER_SIZE, new_buffer.size() - ENC3_HEADER_SIZE, key);
     buffer = new_buffer;
     return true;
 }

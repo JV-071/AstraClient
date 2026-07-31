@@ -66,9 +66,11 @@ public:
 
     const ThingTypePtr& getThingType(uint16 id, ThingCategory category);
     const ItemTypePtr& getItemType(uint16 id);
-    ThingType* rawGetThingType(uint16 id, ThingCategory category) { 
-        VALIDATE(id < m_thingTypes[category].size());
-        return m_thingTypes[category][id].get(); 
+    ThingType* rawGetThingType(uint16 id, ThingCategory category) {
+        const auto categoryIndex = static_cast<size_t>(category);
+        if (categoryIndex >= static_cast<size_t>(ThingLastCategory) || id >= m_thingTypes[categoryIndex].size())
+            return m_nullThingType.get();
+        return m_thingTypes[categoryIndex][id].get();
     }
     ItemType* rawGetItemType(uint16 id) { 
         VALIDATE(id < m_itemTypes.size());
@@ -90,7 +92,11 @@ public:
     bool isXmlLoaded() { return m_xmlLoaded; }
     bool isOtbLoaded() { return m_otbLoaded; }
 
-    bool isValidDatId(uint16 id, ThingCategory category) { return id >= 1 && id < m_thingTypes[category].size(); }
+    bool isValidDatId(uint16 id, ThingCategory category) {
+        const auto categoryIndex = static_cast<size_t>(category);
+        return categoryIndex < static_cast<size_t>(ThingLastCategory) &&
+               id >= 1 && id < m_thingTypes[categoryIndex].size();
+    }
     bool isValidOtbId(uint16 id) { return id >= 1 && id < m_itemTypes.size(); }
 
 private:

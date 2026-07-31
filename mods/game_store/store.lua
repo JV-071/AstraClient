@@ -14,6 +14,8 @@ giftWindow = nil
 
 local categoryUpdateEvent = nil
 local contentUpdateEvent = nil
+-- Shared with the purchase callback in classes/Offers.lua.
+ensureStoreWindow = nil
 
 local function cancelPendingStoreUpdates(cancelRenders)
   removeEvent(categoryUpdateEvent)
@@ -33,7 +35,7 @@ local function queueStoreUpdate(eventName, callback)
     removeEvent(categoryUpdateEvent)
     categoryUpdateEvent = scheduleEvent(function()
       categoryUpdateEvent = nil
-      if StoreWindow then
+      if ensureStoreWindow() then
         callback()
       end
     end, 1)
@@ -43,7 +45,7 @@ local function queueStoreUpdate(eventName, callback)
   removeEvent(contentUpdateEvent)
   contentUpdateEvent = scheduleEvent(function()
     contentUpdateEvent = nil
-    if StoreWindow then
+    if ensureStoreWindow() then
       callback()
     end
   end, 1)
@@ -64,7 +66,11 @@ local importFiles = {
   'styles/pixdonate'
 }
 
-function init()
+ensureStoreWindow = function()
+  if StoreWindow then
+    return StoreWindow
+  end
+
   StoreWindow = g_ui.displayUI('store')
   StoreWindow:hide()
 
@@ -90,6 +96,12 @@ function init()
   pixWindow:hide()
 
   offerCheckBox = UIRadioGroup.create()
+  connect(offerCheckBox, { onSelectionChange = onSelectionOffer })
+
+  return StoreWindow
+end
+
+function init()
   connect(g_game, {
     onStoreInit = onStoreInit,
     onGameEnd = onGameEnd,
@@ -113,8 +125,6 @@ function init()
     onRecvPixURL = onRecvPixURL,
     onCharacterBazarCheckInformations = onCharacterBazarCheckInformations
   })
-
-  connect(offerCheckBox, { onSelectionChange = onSelectionOffer })
 
   if initStoreProtocol then
     initStoreProtocol()
@@ -161,8 +171,11 @@ function terminate()
     onCharacterBazarCheckInformations = onCharacterBazarCheckInformations
   })
 
-  disconnect(offerCheckBox, { onSelectionChange = onSelectionOffer })
-  offerCheckBox = nil
+  if offerCheckBox then
+    disconnect(offerCheckBox, { onSelectionChange = onSelectionOffer })
+    offerCheckBox:destroy()
+    offerCheckBox = nil
+  end
 
 
   if buyOfferWindow then
@@ -206,6 +219,17 @@ end
 function onGameEnd()
   cancelPendingStoreUpdates(true)
 
+  Offers:stopAllEvents()
+  Store:resetSession()
+  if Categories.reset then
+    Categories:reset()
+  end
+
+  if not StoreWindow then
+    g_client.setInputLockWidget(nil)
+    return
+  end
+
   if StoreWindow:isVisible() then
     StoreWindow:hide()
   end
@@ -213,12 +237,6 @@ function onGameEnd()
   if buyOfferWindow:isVisible() then
     buyOfferWindow:hide()
   end
-  Offers:stopAllEvents()
-  Store:resetSession()
-  if Categories.reset then
-    Categories:reset()
-  end
-
   if hirelingWindow:isVisible() then
     hirelingWindow:hide()
   end
@@ -252,6 +270,12 @@ end
 
 function closeStore()
   cancelPendingStoreUpdates(false)
+
+  if not StoreWindow then
+    g_client.setInputLockWidget(nil)
+    Offers:stopAllEvents()
+    return
+  end
 
   if StoreWindow:isVisible() then
     StoreWindow:hide()
@@ -289,6 +313,8 @@ local function updateCoinBalanceWidgets(refreshOffers)
 end
 
 function showStoreWindow()
+  ensureStoreWindow()
+
   StoreWindow:show(true)
   StoreWindow:raise()
   StoreWindow:focus()
@@ -372,6 +398,7 @@ function showError(title, errorMessage)
 end
 
 function onStoreError(errorType, message)
+  ensureStoreWindow()
   StoreWindow:hide()
   g_client.setInputLockWidget(nil)
   showError('Purchase Error', message)
@@ -394,6 +421,8 @@ function requestHistory()
 end
 
 function onStoreTransactionHistory(currentPage, pageCount, offers)
+  ensureStoreWindow()
+
   if Offers.displayPanel then
     Offers.displayPanel:destroy()
   end
@@ -443,6 +472,10 @@ function onStoreTransactionHistory(currentPage, pageCount, offers)
     end
     itemBox.description:setText(short_text(item.name, 35))
     itemBox.description.desc:setTooltip(item.name)
+  end
+
+  if not StoreWindow:isVisible() then
+    showStoreWindow()
   end
 end
 
@@ -578,6 +611,10 @@ end
 
 -- Hireling name change
 function onHirelingNameChange(hirelingId, creatureId)
+  if not ensureStoreWindow() then
+    return
+  end
+
   g_ui.setInputLockWidget(hirelingNameWindow)
   hirelingNameWindow:show()
   hirelingNameWindow:focus()
@@ -721,6 +758,10 @@ function onCpfChange(widget, text)
 end
 
 function onRecvPixData(pixList)
+  if not ensureStoreWindow() then
+    return
+  end
+
   if not pixWindow:isVisible() then
     pixWindow:show()
   end
@@ -789,6 +830,10 @@ function onTermConditionChange(widgetId, value)
 end
 
 function onRecvPixURL(url, token)
+  if not ensureStoreWindow() then
+    return
+  end
+
   if not pixWindow:isVisible() then
     pixWindow:show()
   end

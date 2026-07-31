@@ -382,6 +382,8 @@ bool Creature::canShoot(int distance)
 
 void Creature::turn(Otc::Direction direction)
 {
+    if (direction < Otc::North || direction > Otc::NorthWest)
+        return;
     setDirection(direction);
     callLuaField("onTurn", direction);
 }
@@ -747,7 +749,8 @@ void Creature::setHealthPercent(uint8 healthPercent)
 
 void Creature::setDirection(Otc::Direction direction)
 {
-    VALIDATE(direction != Otc::InvalidDirection);
+    if (direction < Otc::North || direction > Otc::NorthWest)
+        return;
     m_direction = direction;
 }
 
