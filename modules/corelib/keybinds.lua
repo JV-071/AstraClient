@@ -263,7 +263,13 @@ KeyBinds.Hotkeys = {
         jsonName = "ShowOptionsHotkeys",
         bindKeyDown = function()
           if not canPerformAction() then return end
-          addEvent(function() m_settings.toggleHotkeys() end)
+          addEvent(function()
+            if modules.game_hotkeys and modules.game_hotkeys.toggle then
+              modules.game_hotkeys.toggle()
+            else
+              m_settings.toggleHotkeys()
+            end
+          end)
         end,
       },
       ["Open Prey Dialog"] = {
@@ -914,6 +920,9 @@ function KeyBinds:setupAndReset(profile, chatType)
       if bindData.dontBindChatoff and chatType == 'chatOff' then
         canBind = false
       end
+      if isKeyClaimedByHotkeyManager(hotkey) then
+        canBind = false
+      end
 
       if bindData.bindKeyDown and canBind then
         g_keyboard.bindKeyDown(hotkey, bindData.bindKeyDown)
@@ -953,6 +962,9 @@ function KeyBinds:setup()
 			local bindData = KeyBinds:getBindFunction(setting)
       local canBind = true
       if bindData.dontBindChatoff and chatType == 'chatOff' then
+        canBind = false
+      end
+      if isKeyClaimedByHotkeyManager(hotkey) then
         canBind = false
       end
 
@@ -1012,6 +1024,9 @@ function KeyBind:getFirstKey() return self.firstKey end
 function KeyBind:getSecondKey() return self.secondKey end
 
 function KeyBind:setFirstKey(key)
+  if key and key ~= '' and modules.game_hotkeys and modules.game_hotkeys.removeHotkeyByCombo then
+    modules.game_hotkeys.removeHotkeyByCombo(key)
+  end
   if self.action == "Go North-East" or self.action == "Go North-West" or self.action == "Go South-East" or self.action == "Go South-West" then
     if self.firstKey then
       g_ui.removeDiagonalKey(getKeyCode(self.firstKey))
@@ -1090,6 +1105,9 @@ function KeyBind:setFirstKey(key)
 end
 
 function KeyBind:setSecondKey(key)
+  if key and key ~= '' and modules.game_hotkeys and modules.game_hotkeys.removeHotkeyByCombo then
+    modules.game_hotkeys.removeHotkeyByCombo(key)
+  end
   if self.action == "Go North-East" or self.action == "Go North-West" or self.action == "Go South-East" or self.action == "Go South-West" then
     if self.secondKey then
       g_ui.removeDiagonalKey(getKeyCode(self.secondKey))
@@ -1270,7 +1288,10 @@ function KeyBind:deactive()
 end
 
 function KeyBinds:hotkeyIsUsed(key)
-  return hotkeys[key] ~= nil
+  if hotkeys[key] ~= nil then
+    return true
+  end
+  return isKeyClaimedByHotkeyManager(key)
 end
 
 function KeyBinds:isUsedHotkey(key)
