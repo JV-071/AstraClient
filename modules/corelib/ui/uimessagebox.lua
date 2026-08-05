@@ -115,10 +115,6 @@ function displayNonCloseInfoBox(title, message)
   return messageBox
 end
 
-function alert(message)
-	return displayInfoBox("Alert", tostring(message or ""))
-end
-
 function displayErrorBox(title, message)
   local messageBox
   local defaultCallback = function() messageBox:ok() end
