@@ -42,12 +42,73 @@
 #include <framework/html/htmlmanager.h>
 #include <framework/util/extras.h>
 #include <framework/util/stats.h>
+#include <mutex>
 
 #ifdef FW_SOUND
 #include <framework/sound/soundmanager.h>
 #endif
 
 GraphicalApplication g_app;
+
+namespace {
+    // Fallback FPS used when VSync is requested but could not be applied by the driver.
+    // This prevents an unbounded render loop when swapBuffers() does not block.
+    constexpr int VSYNC_FALLBACK_FPS = 100;
+    // Target FPS when the window is visible but does not have focus.
+    constexpr int UNFOCUSED_FPS = 30;
+    // Target FPS when the window is minimized or hidden.
+    constexpr int HIDDEN_FPS = 10;
+    // Maximum extra sleep between frames to keep latency low.
+    constexpr ticks_t MAX_FRAME_SLEEP_US = 2000;
+    // UI update interval in microseconds (60 Hz)
+    constexpr ticks_t UI_UPDATE_INTERVAL_US = 16666;
+
+    int visualBuildFpsCap(const GraphicalApplication& app, bool visible, bool focused)
+    {
+        if (!visible)
+            return HIDDEN_FPS;
+        if (!focused)
+            return UNFOCUSED_FPS;
+        if (app.isUnlimitedFps())
+            return 0;
+        const int maxFps = app.getMaxFps();
+        return maxFps > 0 ? maxFps : 0;
+    }
+
+    int effectiveFpsCap(const GraphicalApplication& app)
+    {
+        if (!g_window.isVisible())
+            return HIDDEN_FPS;
+        if (!g_window.hasFocus())
+            return UNFOCUSED_FPS;
+        if (app.isUnlimitedFps())
+            return 0;
+        if (app.isVerticalSyncRequested()) {
+            // If the driver did not apply VSync, use a software fallback cap.
+            return g_window.hasVerticalSyncApplied() ? 0 : VSYNC_FALLBACK_FPS;
+        }
+        const int maxFps = app.getMaxFps();
+        return maxFps > 0 ? maxFps : VSYNC_FALLBACK_FPS;
+    }
+
+    ticks_t frameDelayForCap(int cap)
+    {
+        if (cap <= 0)
+            return 0;
+        return 1000000 / cap;
+    }
+
+    bool shouldThrottleFrame(ticks_t lastRender, ticks_t frameDelay, ticks_t now)
+    {
+        return frameDelay > 0 && lastRender + frameDelay > now;
+    }
+
+    ticks_t sleepUntilRender(ticks_t lastRender, ticks_t frameDelay, ticks_t now)
+    {
+        const ticks_t remaining = lastRender + frameDelay - now;
+        return std::min(remaining, MAX_FRAME_SLEEP_US);
+    }
+}
 
 void GraphicalApplication::init(std::vector<std::string>& args)
 {
@@ -149,70 +210,110 @@ void GraphicalApplication::run()
     std::shared_ptr<DrawQueue> drawQueue;
     std::shared_ptr<DrawQueue> drawMapQueue;
     std::shared_ptr<DrawQueue> drawMapForegroundQueue;
-    bool isOnline = false;
+    std::atomic_bool isOnline = false;
     size_t totalFrames = 0;
 
     std::mutex mutex;
     std::thread worker([&] {
         g_dispatcherThreadId = std::this_thread::get_id();
-        ticks_t uiBuildLast = 0;
+
+        const ticks_t startTime = stdext::micros();
+        ticks_t uiBuildLast = startTime;
+        ticks_t mapBuildLast = startTime;
+        ticks_t logicPollLast = 0;
+
         while (!m_stopping) {
             m_processingFrames.addFrame();
-            {
+
+            // Logic/network polling should continue at a steady rate independent of rendering.
+            const ticks_t now = stdext::micros();
+            if (now - logicPollLast >= 1000) {
                 g_clock.update();
                 poll();
                 g_clock.update();
+                logicPollLast = now;
             }
 
-            mutex.lock();
-            const bool cacheUI = m_cacheUI.load();
-            const bool queuesPending = cacheUI ? drawMapQueue != nullptr : drawQueue && drawMapQueue;
-            if (queuesPending && (m_maxFps > 0 || g_window.hasVerticalSync())) {
-                mutex.unlock();
+            const bool visible = g_window.isVisible();
+            const bool focused = g_window.hasFocus();
+
+            // Throttle visual work when hidden or unfocused, but never stop logic polling.
+            const int visualCap = visualBuildFpsCap(*this, visible, focused);
+            const ticks_t visualDelay = frameDelayForCap(visualCap);
+            if (visualDelay > 0 && now - uiBuildLast < visualDelay && now - mapBuildLast < visualDelay && !m_mustRepaint.load()) {
                 AutoStat s(STATS_MAIN, "Sleep");
-                stdext::millisleep(1);
+                const ticks_t sleepUs = std::min(visualDelay - std::min(now - uiBuildLast, now - mapBuildLast), MAX_FRAME_SLEEP_US);
+                stdext::microsleep(sleepUs);
                 continue;
             }
-            mutex.unlock();
 
-            ticks_t renderStart = stdext::millis();
             {
-                AutoStat s(STATS_MAIN, "DrawMapBackground");
-                g_drawQueue = std::make_shared<DrawQueue>();
-                g_ui.render(Fw::MapBackgroundPane);
-            }
-            std::shared_ptr<DrawQueue> mapBackgroundQueue = g_drawQueue;
-            {
-                AutoStat s(STATS_MAIN, "DrawMapForeground");
-                g_drawQueue = std::make_shared<DrawQueue>();
-                g_ui.render(Fw::MapForegroundPane);
+                std::unique_lock<std::mutex> lock(mutex);
+                const bool cacheUI = m_cacheUI.load();
+                const bool queuesPending = cacheUI ? drawMapQueue != nullptr : drawQueue && drawMapQueue;
+                if (queuesPending) {
+                    lock.unlock();
+                    AutoStat s(STATS_MAIN, "Sleep");
+                    stdext::millisleep(1);
+                    continue;
+                }
+                lock.unlock();
             }
 
-            mutex.lock();
-            drawMapQueue = mapBackgroundQueue;
-            drawMapForegroundQueue = g_drawQueue;
-            mutex.unlock();
+            // Build map queues whenever they might be needed, regardless of current online status.
+            // The main thread will decide whether to actually render them.
+            if (visualDelay == 0 || now - mapBuildLast >= visualDelay || m_mustRepaint.load()) {
+                ticks_t renderStart = stdext::millis();
+                std::shared_ptr<DrawQueue> mapBackgroundQueue;
+                {
+                    AutoStat s(STATS_MAIN, "DrawMapBackground");
+                    g_drawQueue = std::make_shared<DrawQueue>();
+                    g_ui.render(Fw::MapBackgroundPane);
+                    mapBackgroundQueue = g_drawQueue;
+                }
+                std::shared_ptr<DrawQueue> mapForegroundQueue;
+                {
+                    AutoStat s(STATS_MAIN, "DrawMapForeground");
+                    g_drawQueue = std::make_shared<DrawQueue>();
+                    g_ui.render(Fw::MapForegroundPane);
+                    mapForegroundQueue = g_drawQueue;
+                }
 
-            const ticks_t uiNow = stdext::micros();
-            if (!cacheUI || m_mustRepaint.load() || uiNow - uiBuildLast >= 16666) {
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    drawMapQueue = mapBackgroundQueue;
+                    drawMapForegroundQueue = mapForegroundQueue;
+                }
+                mapBuildLast = now;
+                g_graphs[GRAPH_CPU_FRAME_TIME].addValue(stdext::millis() - renderStart);
+            }
+
+            // Build foreground UI queue at its own cadence.
+            const bool buildForeground = !m_cacheUI.load() || m_mustRepaint.load() || 
+                                         (visualDelay == 0 && now - uiBuildLast >= UI_UPDATE_INTERVAL_US) ||
+                                         (visualDelay > 0 && now - uiBuildLast >= visualDelay);
+            if (buildForeground) {
+                ticks_t renderStart = stdext::millis();
+                std::shared_ptr<DrawQueue> foregroundQueue;
                 {
                     AutoStat s(STATS_MAIN, "DrawForeground");
                     g_drawQueue = std::make_shared<DrawQueue>();
                     g_ui.render(Fw::ForegroundPane);
+                    foregroundQueue = g_drawQueue;
                 }
 
-                mutex.lock();
-                drawQueue = g_drawQueue;
-                g_drawQueue = nullptr;
-                mutex.unlock();
-                uiBuildLast = uiNow;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    drawQueue = foregroundQueue;
+                    g_drawQueue = nullptr;
+                }
+                uiBuildLast = now;
+                g_graphs[GRAPH_CPU_FRAME_TIME].addValue(stdext::millis() - renderStart);
             }
 
-            g_graphs[GRAPH_CPU_FRAME_TIME].addValue(stdext::millis() - renderStart);
-
-            if (m_maxFps > 0 || g_window.hasVerticalSync()) {
+            if (visualDelay > 0) {
                 AutoStat s(STATS_MAIN, "Sleep");
-                stdext::millisleep(1);
+                stdext::microsleep(std::min(visualDelay, MAX_FRAME_SLEEP_US));
             }
         }
         g_dispatcher.poll(); // last poll
@@ -229,41 +330,63 @@ void GraphicalApplication::run()
         g_clock.update();
         pollGraphics();
 
-        if (!g_window.isVisible()) {
+        const bool visible = g_window.isVisible();
+        const bool focused = g_window.hasFocus();
+
+        // Even when invisible we need to keep processing graphics events and avoid busy waiting.
+        if (!visible) {
             AutoStat s(STATS_RENDER, "Sleep");
-            stdext::millisleep(1);
-            g_adaptiveRenderer.refresh();
+            const int cap = HIDDEN_FPS;
+            const ticks_t delay = frameDelayForCap(cap);
+            const ticks_t now = stdext::micros();
+            if (shouldThrottleFrame(lastRender, delay, now)) {
+                stdext::microsleep(sleepUntilRender(lastRender, delay, now));
+            } else {
+                g_adaptiveRenderer.refresh();
+                lastRender = now;
+            }
             continue;
         }
 
-        int frameDelay = m_maxFps <= 0 ? 0 : (1000000 / m_maxFps);
+        const int cap = effectiveFpsCap(*this);
+        const ticks_t frameDelay = frameDelayForCap(cap);
         ticks_t now = stdext::micros();
-        if (lastRender + frameDelay > now && !m_mustRepaint.load()) {
+        if (shouldThrottleFrame(lastRender, frameDelay, now) && !m_mustRepaint.load()) {
             AutoStat s(STATS_RENDER, "Sleep");
-            stdext::microsleep(std::min<ticks_t>(lastRender + frameDelay - now, 1000));
+            stdext::microsleep(sleepUntilRender(lastRender, frameDelay, now));
             continue;
         }
 
-        mutex.lock();
-        const bool cacheUI = m_cacheUI.load();
-        if ((!drawQueue && !toDrawQueue) || 
-            ((!drawMapQueue || !drawMapForegroundQueue) && isOnline) || 
-            (m_mustRepaint.load() && !drawQueue && !cacheUI)) {
-            mutex.unlock();
-            AutoStat s(STATS_RENDER, "Wait");
-            stdext::millisleep(1);
-            continue;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            const bool cacheUI = m_cacheUI.load();
+            if ((!drawQueue && !toDrawQueue) || 
+                ((!drawMapQueue || !drawMapForegroundQueue) && isOnline) || 
+                (m_mustRepaint.load() && !drawQueue && !cacheUI)) {
+                lock.unlock();
+                AutoStat s(STATS_RENDER, "Wait");
+                stdext::millisleep(1);
+                continue;
+            }
+            toDrawQueue = drawQueue ? drawQueue : toDrawQueue;
+            toDrawMapQueue = drawMapQueue;
+            toDrawMapForegroundQueue = drawMapForegroundQueue;
+            drawQueue = drawMapQueue = drawMapForegroundQueue = nullptr;
         }
-        toDrawQueue = drawQueue ? drawQueue : toDrawQueue;
-        toDrawMapQueue = drawMapQueue;
-        toDrawMapForegroundQueue = drawMapForegroundQueue;
-        drawQueue = drawMapQueue = drawMapForegroundQueue = nullptr;
-        mutex.unlock();
 
         g_adaptiveRenderer.newFrame();
         m_graphicsFrames.addFrame();
         const bool repaintRequested = m_mustRepaint.exchange(false);
-        lastRender = stdext::micros() > lastRender + frameDelay * 2 ? stdext::micros() : lastRender + frameDelay;
+
+        // Advance the render deadline by frameDelay to keep a steady cadence and avoid drift.
+        if (frameDelay > 0) {
+            lastRender += frameDelay;
+            const ticks_t now = stdext::micros();
+            if (now > lastRender + frameDelay)
+                lastRender = now;
+        } else {
+            lastRender = stdext::micros();
+        }
 
         g_painter->resetDraws();
         if (m_scaling > 1.0f) {
@@ -325,11 +448,12 @@ void GraphicalApplication::run()
 
         {
             AutoStat s(STATS_RENDER, "DrawSecondForeground");
+            const bool cacheUI = m_cacheUI.load();
             if (cacheUI) {
                 const Size uiResolution = g_painter->getResolution();
                 const ticks_t uiNow = stdext::micros();
 
-                if (uiResolution != uiCacheSize || repaintRequested || uiNow - uiCacheLastRender >= 16666) {
+                if (uiResolution != uiCacheSize || repaintRequested || uiNow - uiCacheLastRender >= UI_UPDATE_INTERVAL_US) {
                     m_uiFramebuffer->resize(uiResolution);
                     m_uiFramebuffer->bind();
                     g_painter->clear(Color::alpha);

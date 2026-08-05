@@ -53,10 +53,16 @@ public:
     bool isCacheUI() const { return m_cacheUI.load(); }
 
     void setMaxFps(int maxFps) { m_maxFps = maxFps; }
-    int getMaxFps() { return m_maxFps; }
+    int getMaxFps() const { return m_maxFps; }
     int getFps() { return m_graphicsFrames.getFps(); }
     int getGraphicsFps() { return m_graphicsFrames.getFps(); }
     int getProcessingFps() { return m_processingFrames.getFps(); }
+
+    void setVerticalSyncRequested(bool enable) { m_vsyncRequested = enable; }
+    bool isVerticalSyncRequested() const { return m_vsyncRequested; }
+
+    void setUnlimitedFps(bool unlimited) { m_unlimitedFps = unlimited; }
+    bool isUnlimitedFps() const { return m_unlimitedFps; }
 
     bool isOnInputEvent() { return m_onInputEvent; }
 
@@ -81,6 +87,8 @@ private:
     std::atomic<float> m_scaling = 1.0;
     std::atomic<float> m_lastScaling = 1.0;
     std::atomic_int m_maxFps = 100;
+    std::atomic_bool m_vsyncRequested = false;
+    std::atomic_bool m_unlimitedFps = false;
     std::atomic_bool m_mapSmooth = true;
     std::atomic_bool m_cacheUI = true;
     std::atomic_bool m_mustRepaint = false;
