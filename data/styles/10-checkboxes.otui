@@ -39,6 +39,33 @@ CheckBoxCircle < UICheckBox
   $disabled:
     change-cursor-image: false
 
+ThickCheckBox < UICheckBox
+  size: 18 18
+  text-align: left
+  text-offset: 18 0
+  color: #dfdfdf
+  image-color: #dfdfdfff
+  image-rect: 0 0 12 12
+  image-offset: 3 3
+  image-source: /images/ui/checkbox-unchecked
+  change-cursor-image: true
+  cursor: pointer
+
+  $hover !disabled:
+    color: #ffffff
+
+  $checked:
+    image-source: /images/ui/checkbox-checked
+
+  $hover checked:
+    image-source: /images/ui/checkbox-checked
+
+  $disabled:
+    image-color: #dfdfdf88
+    color: #dfdfdf88
+    opacity: 0.8
+    change-cursor-image: false
+
 ColorBox < UICheckBox
   size: 13 13
   image-color: #dfdfdfff

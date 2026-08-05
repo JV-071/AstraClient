@@ -31,6 +31,16 @@
 #include <framework/http/http.h>
 #include <queue>
 #include <regex>
+#include <fstream>
+#include <memory>
+#include <string_view>
+
+#if defined(WIN32)
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #if !defined(ANDROID)
 #include <boost/process.hpp>
@@ -49,6 +59,117 @@ ResourceManager g_resources;
 static const std::string INIT_FILENAME = "init.lua";
 static constexpr size_t MAX_ENCRYPTED_PAYLOAD_SIZE = 512ULL * 1024 * 1024;
 static constexpr size_t ENC3_HEADER_SIZE = 24;
+
+namespace {
+struct PhysFsListDeleter
+{
+    void operator()(char** list) const { PHYSFS_freeList(list); }
+};
+
+bool isPathInside(const std::filesystem::path& root, const std::filesystem::path& candidate)
+{
+    auto rootString = root.lexically_normal().generic_string();
+    auto candidateString = candidate.lexically_normal().generic_string();
+#if defined(WIN32)
+    stdext::tolower(rootString);
+    stdext::tolower(candidateString);
+#endif
+    if (candidateString == rootString)
+        return true;
+    if (!rootString.empty() && rootString.back() != '/')
+        rootString += '/';
+    return stdext::starts_with(candidateString, rootString);
+}
+
+bool isSafeWindowsPathComponent(const std::string& component)
+{
+    if (component.empty() || component.back() == ' ' || component.back() == '.')
+        return false;
+
+    for (const unsigned char character : component) {
+        if (character < 32 || std::string_view("<>:\"/\\|?*").find(character) != std::string_view::npos)
+            return false;
+    }
+
+    auto baseName = component.substr(0, component.find('.'));
+    while (!baseName.empty() && (baseName.back() == ' ' || baseName.back() == '.'))
+        baseName.pop_back();
+    stdext::tolower(baseName);
+
+    if (baseName == "con" || baseName == "prn" || baseName == "aux" || baseName == "nul")
+        return false;
+    if (baseName.size() == 4 && baseName[3] >= '1' && baseName[3] <= '9' &&
+        (stdext::starts_with(baseName, "com") || stdext::starts_with(baseName, "lpt")))
+        return false;
+    return true;
+}
+
+bool isSafeOtuiProjectPath(const std::filesystem::path& path)
+{
+    if (path.empty() || path.is_absolute() || path.has_root_name() || path.has_root_directory())
+        return false;
+
+    std::vector<std::string> parts;
+    for (const auto& part : path) {
+        const auto value = part.generic_string();
+        if (value.empty() || value == "." || value == ".." || !isSafeWindowsPathComponent(value))
+            return false;
+        parts.push_back(value);
+    }
+
+    if (parts.size() < 2)
+        return false;
+    if (parts[0] != "modules" && parts[0] != "mods" &&
+        !(parts.size() >= 3 && parts[0] == "data" && parts[1] == "styles"))
+        return false;
+
+    auto filename = parts.back();
+    stdext::tolower(filename);
+    return stdext::ends_with(filename, ".otui") || stdext::ends_with(filename, ".otui.bak");
+}
+
+bool readDiskFile(const std::filesystem::path& path, std::string& contents)
+{
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream)
+        return false;
+    contents.assign(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+    return stream.good() || stream.eof();
+}
+
+bool writeDiskFile(const std::filesystem::path& path, const std::string& contents)
+{
+    {
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        if (!stream)
+            return false;
+        stream.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+        stream.flush();
+        if (!stream.good())
+            return false;
+        stream.close();
+        if (stream.fail())
+            return false;
+    }
+
+#if defined(WIN32)
+    const HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+    const bool synchronized = ::FlushFileBuffers(file) != 0;
+    const bool closed = ::CloseHandle(file) != 0;
+    return synchronized && closed;
+#else
+    const int file = ::open(path.c_str(), O_WRONLY);
+    if (file == -1)
+        return false;
+    const bool synchronized = ::fsync(file) == 0;
+    const bool closed = ::close(file) == 0;
+    return synchronized && closed;
+#endif
+}
+}
 
 static bool canEncryptPayload(size_t payloadSize)
 {
@@ -181,6 +302,7 @@ bool ResourceManager::setupWriteDir(const std::string& product, const std::strin
 
 bool ResourceManager::setup()
 {
+    m_workDir.clear();
 #ifdef ANDROID
     PHYSFS_File* file = PHYSFS_openRead("data.zip");
     if (file) {
@@ -203,6 +325,10 @@ bool ResourceManager::setup()
 
         if(PHYSFS_exists(INIT_FILENAME.c_str())) {
             g_logger.info(stdext::format("Found work dir at '%s'", dir));
+            std::error_code ec;
+            const auto canonicalDir = std::filesystem::weakly_canonical(std::filesystem::u8path(dir), ec);
+            if (!ec)
+                m_workDir = canonicalDir.generic_string();
             return true;
         }
 
@@ -553,25 +679,317 @@ bool ResourceManager::makeDir(const std::string directory)
     return PHYSFS_mkdir(directory.c_str());
 }
 
-std::list<std::string> ResourceManager::listDirectoryFiles(const std::string& directoryPath, bool fullPath /* = false */, bool raw /*= false*/)
+std::list<std::string> ResourceManager::listDirectoryFiles(const std::string& directoryPath, bool fullPath /* = false */, bool raw /*= false*/, bool recursive /*= false*/)
 {
     std::list<std::string> files;
-    auto path = raw ? directoryPath : resolvePath(directoryPath);
-    auto rc = PHYSFS_enumerateFiles(path.c_str());
+    const auto rootPath = raw ? directoryPath : resolvePath(directoryPath);
 
-    if (!rc)
-        return files;
+    std::function<void(const std::string&, size_t)> visit;
+    visit = [&](const std::string& path, const size_t depth) {
+        if (depth > 64) {
+            g_logger.warning(stdext::format("Directory recursion limit reached at '%s'", path));
+            return;
+        }
 
-    for (int i = 0; rc[i] != NULL; i++) {
-        if(fullPath)
-            files.push_back(path + "/" + rc[i]);
-        else
-            files.push_back(rc[i]);
-    }
+        std::unique_ptr<char*, PhysFsListDeleter> entries(PHYSFS_enumerateFiles(path.c_str()));
+        if (!entries)
+            return;
 
-    PHYSFS_freeList(rc);
+        for (auto current = entries.get(); *current != nullptr; ++current) {
+            const std::string name = *current;
+            const std::string childPath = path.empty() || path == "/" ? "/" + name : path + "/" + name;
+            if (recursive && PHYSFS_isDirectory(childPath.c_str()))
+                visit(childPath, depth + 1);
+            else
+                files.push_back((recursive || fullPath) ? childPath : name);
+        }
+    };
+
+    visit(rootPath, 0);
     files.sort();
     return files;
+}
+
+std::string ResourceManager::getRealDir(const std::string& path)
+{
+    const auto resolvedPath = resolvePath(path);
+    const char* realDir = PHYSFS_getRealDir(resolvedPath.c_str());
+    return realDir ? realDir : "";
+}
+
+ticks_t ResourceManager::getFileTime(const std::string& path)
+{
+    const auto resolvedPath = resolvePath(path);
+    const char* realDir = PHYSFS_getRealDir(resolvedPath.c_str());
+    if (!realDir)
+        return 0;
+
+    std::error_code ec;
+    const auto basePath = std::filesystem::u8path(realDir);
+    if (!std::filesystem::is_directory(basePath, ec) || ec)
+        return 0;
+
+    const auto relativePath = std::filesystem::u8path(resolvedPath).relative_path();
+    return g_platform.getFileModificationTime((basePath / relativePath).string());
+}
+
+bool ResourceManager::writeFileContentsToWorkDir(const std::string& relativePath, const std::string& contents) try
+{
+#if defined(ANDROID)
+    g_logger.warning("Project file writing is unavailable on Android");
+    return false;
+#else
+    if (m_workDir.empty()) {
+        g_logger.warning("Project file writing is unavailable without a real work directory");
+        return false;
+    }
+
+    const auto relative = std::filesystem::u8path(relativePath);
+    if (!isSafeOtuiProjectPath(relative)) {
+        g_logger.warning(stdext::format("Rejected unsafe project file path '%s'", relativePath));
+        return false;
+    }
+
+    std::error_code ec;
+    const auto root = std::filesystem::weakly_canonical(std::filesystem::u8path(m_workDir), ec);
+    if (ec || !std::filesystem::is_directory(root, ec)) {
+        g_logger.warning("Project work directory is not accessible");
+        return false;
+    }
+
+    const auto target = root / relative;
+    const auto parent = std::filesystem::weakly_canonical(target.parent_path(), ec);
+    if (ec || !std::filesystem::is_directory(parent, ec) || !isPathInside(root, parent)) {
+        g_logger.warning(stdext::format("Rejected project file outside the work directory '%s'", relativePath));
+        return false;
+    }
+
+    const bool existed = std::filesystem::exists(target, ec);
+    if (ec)
+        return false;
+    if (existed) {
+        const auto status = std::filesystem::symlink_status(target, ec);
+        if (ec || std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status)) {
+            g_logger.warning(stdext::format("Rejected non-regular project file '%s'", relativePath));
+            return false;
+        }
+
+        const auto canonicalTarget = std::filesystem::canonical(target, ec);
+        if (ec || !isPathInside(root, canonicalTarget)) {
+            g_logger.warning(stdext::format("Rejected project file resolving outside the work directory '%s'", relativePath));
+            return false;
+        }
+    }
+
+    const std::string virtualPath = "/" + relative.generic_string();
+    if (fileExists(virtualPath)) {
+        const auto realDir = getRealDir(virtualPath);
+        const auto canonicalRealDir = std::filesystem::weakly_canonical(std::filesystem::u8path(realDir), ec);
+        if (realDir.empty() || ec || canonicalRealDir != root) {
+            g_logger.warning(stdext::format("Rejected project file shadowed by another resource '%s'", relativePath));
+            return false;
+        }
+    }
+
+    std::string original;
+    if (existed && !readDiskFile(target, original)) {
+        g_logger.warning(stdext::format("Unable to read project file before writing '%s'", relativePath));
+        return false;
+    }
+
+    auto temporary = target;
+    temporary += ".tmp";
+    auto rollback = target;
+    rollback += ".rollback";
+
+    enum class RestoreResult {
+        Restored,
+        OriginalAtRollback,
+        OriginalLost,
+    };
+
+    const auto originalAtRollback = [&]() {
+        std::error_code checkError;
+        const auto status = std::filesystem::symlink_status(rollback, checkError);
+        if (checkError || std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status))
+            return false;
+
+        std::string rollbackContents;
+        return readDiskFile(rollback, rollbackContents) && rollbackContents == original;
+    };
+
+    const auto restoreOriginal = [&]() {
+        std::error_code restoreError;
+        if (std::filesystem::exists(target, restoreError)) {
+            std::filesystem::remove(target, restoreError);
+            if (restoreError) {
+                if (originalAtRollback()) {
+                    g_logger.error(stdext::format(
+                        "Unable to remove a failed project file; the original remains at '%s'",
+                        rollback.string()));
+                    return RestoreResult::OriginalAtRollback;
+                }
+                g_logger.error(stdext::format(
+                    "Unable to remove a failed project file; the original may be lost (target '%s')",
+                    target.string()));
+                return RestoreResult::OriginalLost;
+            }
+        }
+
+        std::filesystem::rename(rollback, target, restoreError);
+        if (restoreError) {
+            if (originalAtRollback()) {
+                g_logger.error(stdext::format(
+                    "Unable to restore the project file; the original remains at '%s'",
+                    rollback.string()));
+                return RestoreResult::OriginalAtRollback;
+            }
+            g_logger.error(stdext::format(
+                "Unable to restore the project file; the original may be lost (target '%s')", target.string()));
+            return RestoreResult::OriginalLost;
+        }
+
+        std::string restored;
+        if (!readDiskFile(target, restored) || restored != original) {
+            g_logger.error(stdext::format(
+                "Restored project file verification failed for '%s'; the original may be lost",
+                relativePath));
+            return RestoreResult::OriginalLost;
+        }
+        return RestoreResult::Restored;
+    };
+
+    const auto reportRestore = [&](const char* operation, RestoreResult result) {
+        if (result == RestoreResult::Restored) {
+            g_logger.warning(stdext::format(
+                "%s aborted; the original project file remains intact", operation));
+        } else if (result == RestoreResult::OriginalAtRollback) {
+            g_logger.error(stdext::format(
+                "%s aborted; the original project file remains at '%s'", operation, rollback.string()));
+        } else {
+            g_logger.error(stdext::format(
+                "%s aborted; the original project file may be lost (check '%s')", operation, target.string()));
+        }
+    };
+
+    const bool hasRollback = std::filesystem::exists(rollback, ec);
+    if (ec) {
+        g_logger.error(stdext::format(
+            "Unable to inspect previous project file transaction '%s'", rollback.string()));
+        return false;
+    }
+    if (hasRollback) {
+
+        std::error_code targetError;
+        std::error_code rollbackError;
+        const auto targetStatus = std::filesystem::symlink_status(target, targetError);
+        const auto rollbackStatus = std::filesystem::symlink_status(rollback, rollbackError);
+        if (targetError || rollbackError || std::filesystem::is_symlink(targetStatus) ||
+            !std::filesystem::is_regular_file(targetStatus) || std::filesystem::is_symlink(rollbackStatus) ||
+            !std::filesystem::is_regular_file(rollbackStatus)) {
+            g_logger.error(stdext::format(
+                "Previous project transaction cannot be recovered safely; target or rollback is not a regular file. "
+                "Inspect '%s' before retrying.",
+                rollback.string()));
+            return false;
+        }
+
+        std::string targetContents;
+        std::string rollbackContents;
+        if (!readDiskFile(target, targetContents) || !readDiskFile(rollback, rollbackContents)) {
+            g_logger.error(stdext::format(
+                "Previous project transaction cannot be recovered safely; target '%s' or rollback '%s' "
+                "cannot be read.",
+                target.string(), rollback.string()));
+            return false;
+        }
+        const bool targetMatchesRollback = targetContents == rollbackContents;
+
+        std::error_code removeRollbackError;
+        if (!std::filesystem::remove(rollback, removeRollbackError) || removeRollbackError) {
+            g_logger.error(stdext::format(
+                "Recovered project target '%s', but could not remove rollback '%s'. "
+                "Inspect the rollback before retrying.",
+                target.string(), rollback.string()));
+            return false;
+        }
+        g_logger.warning(stdext::format(
+            "Recovered completed project file transaction '%s' (target %s rollback); continuing with the new write",
+            target.string(), targetMatchesRollback ? "matches" : "differs from"));
+    }
+    std::filesystem::remove(temporary, ec);
+    ec.clear();
+
+    if (!writeDiskFile(temporary, contents)) {
+        std::filesystem::remove(temporary, ec);
+        g_logger.warning(stdext::format("Unable to write project file temporary '%s'", relativePath));
+        return false;
+    }
+
+    std::string temporaryContents;
+    if (!readDiskFile(temporary, temporaryContents) || temporaryContents != contents) {
+        std::filesystem::remove(temporary, ec);
+        g_logger.warning(stdext::format("Project file temporary verification failed '%s'", relativePath));
+        return false;
+    }
+
+    if (existed) {
+        std::filesystem::rename(target, rollback, ec);
+        if (ec) {
+            std::filesystem::remove(temporary, ec);
+            g_logger.warning(stdext::format("Unable to preserve project file before replacement '%s'", relativePath));
+            return false;
+        }
+
+        std::string rollbackContents;
+        if (!readDiskFile(rollback, rollbackContents) || rollbackContents != original) {
+            const auto restoreResult = restoreOriginal();
+            reportRestore("Project file rollback verification", restoreResult);
+            std::filesystem::remove(temporary, ec);
+            g_logger.warning(stdext::format("Project file rollback verification failed '%s'", relativePath));
+            return false;
+        }
+    }
+
+    std::filesystem::rename(temporary, target, ec);
+    if (ec) {
+        if (existed) {
+            const auto restoreResult = restoreOriginal();
+            reportRestore("Project file replacement", restoreResult);
+        }
+        std::filesystem::remove(temporary, ec);
+        g_logger.warning(stdext::format("Unable to replace project file '%s'", relativePath));
+        return false;
+    }
+
+    std::string confirmed;
+    if (!readDiskFile(target, confirmed) || confirmed != contents) {
+        if (existed) {
+            const auto restoreResult = restoreOriginal();
+            reportRestore("Project file verification", restoreResult);
+        } else {
+            std::filesystem::remove(target, ec);
+        }
+        g_logger.warning(stdext::format("Project file verification failed after replacement '%s'", relativePath));
+        return false;
+    }
+
+    if (existed) {
+        std::error_code removeRollbackError;
+        if (!std::filesystem::remove(rollback, removeRollbackError) || removeRollbackError)
+            g_logger.error(stdext::format(
+                "Project file was written, but could not remove rollback '%s'. "
+                "The backup remains available for recovery.",
+                rollback.string()));
+    }
+    return true;
+#endif
+}
+catch (const std::exception& exception)
+{
+    g_logger.warning(stdext::format(
+        "Project file transaction failed for '%s': %s", relativePath, exception.what()));
+    return false;
 }
 
 std::string ResourceManager::resolvePath(std::string path)
