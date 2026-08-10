@@ -1420,19 +1420,6 @@ toggleNextWindow = function()
 end
 
 function BattlePass.onBattlePassMissionsFromServer(data)
-    -- Converter outfit JSON para formato do client
-    if data.playerOutfit then
-        local o = data.playerOutfit
-        BattlePass.outfitWidget:setOutfit({
-            type = o.type or 0,
-            head = o.head or 0,
-            body = o.body or 0,
-            legs = o.legs or 0,
-            feet = o.feet or 0,
-            addons = o.addons or 0,
-        })
-    end
-
     BattlePass.beginTime = data.beginTime or 0
     BattlePass.endTime = data.endTime or 0
     BattlePass.progressPoints = data.points or 0
@@ -1456,8 +1443,36 @@ function BattlePass.onBattlePassMissionsFromServer(data)
         BattlePassShop.updateBalance(BattlePass.shopPoints, BattlePass.shopUnlocked)
     end
 
-    local getVipPassTicketButton = BattlePass.window:recursiveGetChildById('getVipPassTicket')
-    local getVipPassTicketBorder = BattlePass.window:recursiveGetChildById('getVipPassTicketBorder')
+    local window = BattlePass.window
+    if not window or window:isDestroyed() then
+        return
+    end
+
+    local outfitWidget = BattlePass.outfitWidget
+    if not outfitWidget or outfitWidget:isDestroyed() then
+        outfitWidget = window:recursiveGetChildById('playerOutfit')
+        BattlePass.outfitWidget = outfitWidget
+    end
+    if not outfitWidget then
+        g_logger.error('[Battle Pass] Unable to update missions: playerOutfit widget is missing')
+        return
+    end
+
+    -- Converter outfit JSON para formato do client
+    if data.playerOutfit then
+        local o = data.playerOutfit
+        outfitWidget:setOutfit({
+            type = o.type or 0,
+            head = o.head or 0,
+            body = o.body or 0,
+            legs = o.legs or 0,
+            feet = o.feet or 0,
+            addons = o.addons or 0,
+        })
+    end
+
+    local getVipPassTicketButton = window:recursiveGetChildById('getVipPassTicket')
+    local getVipPassTicketBorder = window:recursiveGetChildById('getVipPassTicketBorder')
     if getVipPassTicketButton then
         getVipPassTicketButton:setVisible(not BattlePass.premiumBattlepass)
         getVipPassTicketBorder:setVisible(not BattlePass.premiumBattlepass)
