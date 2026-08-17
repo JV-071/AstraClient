@@ -39,10 +39,37 @@ function init()
 end
 
 function terminate()
+	disconnect(g_game, {
+		onQuestLog = onGameQuestLog,
+		onQuestLine = onGameQuestLine,
+		onQuestTracker = onQuestTracker,
+		onUpdateQuestTracker = onUpdateQuestTracker,
+		onGameEnd = offline,
+		onGameStart = online
+	})
+
+	-- release the lock only if this module still holds it. Clearing it
+	-- unconditionally would unlock the UI while another module's modal is up.
+	-- The onDestroy hook in globals.lua already drops the stored reference; this
+	-- is what hands focus back to the game panel.
+	if g_ui.getCustomInputWidget() == questlog then
+		g_client.setInputLockWidget(nil)
+	end
+
 	if questlog then
 		questlog:destroy()
 		questlog = nil
 	end
+
+	if trackerWindow then
+		trackerWindow:destroy()
+		trackerWindow = nil
+	end
+
+	showCompletedButton = nil
+	showHiddenButton = nil
+	filterWidget = nil
+	trackerButton = nil
 end
 
 function toggle()
