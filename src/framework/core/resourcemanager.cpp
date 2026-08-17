@@ -674,6 +674,87 @@ bool ResourceManager::deleteFile(const std::string& fileName)
     return PHYSFS_delete(resolvePath(fileName).c_str()) != 0;
 }
 
+bool ResourceManager::copyFile(const std::string& fromFileName, const std::string& toFileName)
+{
+    // Streams in fixed chunks so callers can back up multi-hundred-megabyte files
+    // (minimap dumps, for one) without ever holding them in memory.
+    const std::string fromPath = resolvePath(fromFileName);
+
+    PHYSFS_File* from = PHYSFS_openRead(fromPath.c_str());
+    if(!from) {
+        g_logger.error(stdext::format("unable to open file for reading '%s': %s", fromPath, PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode())));
+        return false;
+    }
+
+    // Write to a scratch file so an interrupted copy never truncates whatever is already
+    // at the destination; that file may be the only surviving copy during a rollback.
+    const std::string tempPath = toFileName + ".part";
+
+    PHYSFS_File* to = PHYSFS_openWrite(tempPath.c_str());
+    if(!to) {
+        g_logger.error(stdext::format("unable to open file for writing '%s': %s", tempPath, PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode())));
+        PHYSFS_close(from);
+        return false;
+    }
+
+    std::vector<char> buffer(64 * 1024);
+    bool ok = true;
+    while(true) {
+        const PHYSFS_sint64 bytesRead = PHYSFS_readBytes(from, buffer.data(), buffer.size());
+        if(bytesRead < 0) {
+            g_logger.error(stdext::format("unable to read file '%s': %s", fromPath, PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode())));
+            ok = false;
+            break;
+        }
+        if(bytesRead == 0)
+            break;
+        if(PHYSFS_writeBytes(to, buffer.data(), bytesRead) != bytesRead) {
+            g_logger.error(stdext::format("unable to write file '%s': %s", tempPath, PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode())));
+            ok = false;
+            break;
+        }
+    }
+
+    if(PHYSFS_close(from) == 0)
+        g_logger.error(stdext::format("unable to close file '%s': %s", fromPath, PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode())));
+
+    // Buffered writes are only known to have reached the disk once the close succeeds,
+    // so a failure here means the copy is incomplete no matter what the loop reported.
+    if(PHYSFS_close(to) == 0) {
+        g_logger.error(stdext::format("unable to close file '%s': %s", tempPath, PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode())));
+        ok = false;
+    }
+
+    if(!ok) {
+        PHYSFS_delete(tempPath.c_str());
+        return false;
+    }
+
+    // PhysFS has no rename, and openWrite always lands in the write dir, so the swap is
+    // done on the real paths underneath it. Only now is the destination allowed to go away.
+    const char* writeDir = PHYSFS_getWriteDir();
+    if(!writeDir) {
+        g_logger.error("unable to resolve the write dir to finish the copy");
+        PHYSFS_delete(tempPath.c_str());
+        return false;
+    }
+
+    const auto toRealPath = [&](const std::string& path) {
+        return std::filesystem::path(writeDir) /
+            std::filesystem::u8path(stdext::starts_with(path, "/") ? path.substr(1) : path);
+    };
+
+    std::error_code ec;
+    std::filesystem::rename(toRealPath(tempPath), toRealPath(toFileName), ec);
+    if(ec) {
+        g_logger.error(stdext::format("unable to move '%s' onto '%s': %s", tempPath, toFileName, ec.message()));
+        PHYSFS_delete(tempPath.c_str());
+        return false;
+    }
+
+    return true;
+}
+
 bool ResourceManager::makeDir(const std::string directory)
 {
     return PHYSFS_mkdir(directory.c_str());
