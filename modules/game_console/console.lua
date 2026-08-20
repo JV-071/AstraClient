@@ -177,6 +177,7 @@ function enableChat(temporarily)
   consoleTextEdit:setText(currentTextMessage)
   currentTextMessage = ''
   consoleTextEdit:setCursorPos(-1)
+  consoleTextEdit:focus()
 
   modules.game_walking.disableWSAD()
 
