@@ -8,6 +8,7 @@ local refreshEvent = nil
 local saveEvent = nil
 local pendingSettings = nil
 local callbacksConnected = false
+local botCreatedLeftPanel = false
 local callbackConnections = nil
 local nextMessageCleanup = 0
 
@@ -173,8 +174,10 @@ function init()
   botButton:setOn(false)
   botButton:hide()
 
-  botWindow = g_ui.loadUI('bot', modules.game_interface.getLeftPanel())
+  botWindow = g_ui.loadUI('bot', modules.game_interface.getRightPanel())
   botWindow:setup()
+  -- Force bot window to start closed regardless of saved state
+  botWindow:close()
   applyBotFonts(botWindow)
 
   contentsPanel = botWindow.contentsPanel
@@ -419,17 +422,54 @@ end
 
 function toggle()
   if botButton:isOn() then
+    -- Close bot and remove left panel if we created it
     botWindow:close()
     botButton:setOn(false)
+    if botCreatedLeftPanel then
+      local leftPanel = modules.game_interface.getLeftPanel()
+      -- Only remove the left panel if the bot is the only child (or it's empty after close)
+      local childCount = 0
+      if leftPanel then
+        for _, child in ipairs(leftPanel:getChildren()) do
+          if child:isVisible() then
+            childCount = childCount + 1
+          end
+        end
+      end
+      if childCount <= 0 then
+        modules.game_interface.removeLeftPanel()
+        botCreatedLeftPanel = false
+      end
+    end
+    setButtonState(false)
   else
+    -- Ensure a left panel exists and move bot there
+    local gi = modules.game_interface
+    local leftPanel = gi.getLeftPanel()
+    local rightPanel = gi.getRightPanel()
+    -- If getLeftPanel returns the right panel, there is no left panel yet
+    if leftPanel == rightPanel then
+      gi.addLeftPanel()
+      leftPanel = gi.getLeftPanel()
+      botCreatedLeftPanel = true
+    end
+    -- Move bot window to the left panel
+    if leftPanel and botWindow:getParent() ~= leftPanel then
+      botWindow:setParent(leftPanel)
+    end
     botWindow:open()
     botButton:setOn(true)
+    setButtonState(true)
   end
 end
 
 function online()
   botButton:show()
-  setButtonState(botWindow:isVisible())
+  -- Force bot window closed on login - user must open it manually
+  if botWindow:isVisible() then
+    botWindow:close()
+  end
+  setButtonState(false)
   local profiles = modules.client_profiles
   if not profiles or not profiles.ChangedProfile then
     queueRefresh(nil, 20)
@@ -446,6 +486,11 @@ function offline()
   botButton:hide()
   setButtonState(false)
   editWindow:hide()
+  -- Clean up left panel if we created it
+  if botCreatedLeftPanel then
+    pcall(function() modules.game_interface.removeLeftPanel() end)
+    botCreatedLeftPanel = false
+  end
 end
 
 function onError(message)
