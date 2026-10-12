@@ -73,6 +73,11 @@ Application::Application()
 #endif
 }
 
+std::string Application::getBuildDate()
+{
+    return std::string(__DATE__);
+}
+
 void Application::init(std::vector<std::string>& args)
 {
     // capture exit signals
