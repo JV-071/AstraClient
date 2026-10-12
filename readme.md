@@ -83,6 +83,8 @@ astraclient-windows-<commit-sha>
 
 For **Code > Download ZIP** to include the actual assets, a repository administrator must enable **Settings > Archives > Include Git LFS objects in archives**. This is a repository setting, so merging a code change does not enable it. See [GitHub's archive setting documentation](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/managing-repository-settings/managing-git-lfs-objects-in-archives-of-your-repository).
 
+Archives containing LFS payloads count toward the account's LFS bandwidth usage; additional bandwidth can incur charges under the account's plan.
+
 Alternatively, install Git LFS and clone the repository:
 
 ```sh
