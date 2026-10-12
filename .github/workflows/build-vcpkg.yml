@@ -51,7 +51,9 @@ jobs:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_cache
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_cache,readwrite
       VCPKG_DOWNLOADS: ${{ github.workspace }}/vcpkg-downloads
-      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_GHA_ENABLED: 'false'
+      SCCACHE_CACHE_SIZE: 1G
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
       SCCACHE_IDLE_TIMEOUT: '0'
       SCCACHE_LOG: warn
@@ -66,6 +68,8 @@ jobs:
       - name: Read build context
         shell: pwsh
         run: |
+          $env:SCCACHE_DIR = Join-Path $env:RUNNER_TEMP 'sccache'
+          "SCCACHE_DIR=$env:SCCACHE_DIR" >> $env:GITHUB_ENV
           & ./cmake/ci/ReadBuildContext.ps1
         id: vcpkg-baseline
 
@@ -82,14 +86,26 @@ jobs:
             vcpkg-bincache-x64-
             vcpkg-bincache-
 
+      - name: Restore compiler objects
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: compiler-objects
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: compiler-astraclient-v1-windows-x64-${{ steps.vcpkg-baseline.outputs.toolset }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: compiler-astraclient-v1-windows-x64-${{ steps.vcpkg-baseline.outputs.toolset }}-
+
       - name: Install verified compiler cache
+        id: compiler-setup
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         continue-on-error: true
         with:
           script: |
-            // Runtime credentials are inherited only by setup and the cache daemon.
-            if (process.env.ACTIONS_RUNTIME_TOKEN) core.setSecret(process.env.ACTIONS_RUNTIME_TOKEN);
-            await exec.exec('pwsh', ['-NoLogo', '-NoProfile', '-File', 'cmake/ci/SetupCompilerCache.ps1']);
+            const childEnv = { ...process.env };
+            delete childEnv.ACTIONS_RUNTIME_TOKEN;
+            delete childEnv.ACTIONS_RESULTS_URL;
+            delete childEnv['INPUT_GITHUB-TOKEN'];
+            await exec.exec('pwsh', ['-NoLogo', '-NoProfile', '-File', 'cmake/ci/SetupCompilerCache.ps1'], { env: childEnv });
 
       - name: Checkout pinned vcpkg
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -191,10 +207,22 @@ jobs:
         shell: pwsh
         run: |
           if (Get-Command sccache -ErrorAction SilentlyContinue) {
-            & ./cmake/ci/InvokeBuildStage.ps1 -Name compiler-cache -Executable sccache -Arguments @('--show-stats')
+            try {
+              & ./cmake/ci/InvokeBuildStage.ps1 -Name compiler-cache -Executable sccache -Arguments @('--show-stats')
+            } finally {
+              sccache --stop-server
+            }
           }
         if: always()
         continue-on-error: true
+
+      - name: Save compiler objects
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        if: ${{ !cancelled() && steps.compiler-setup.outcome == 'success' }}
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ steps.compiler-objects.outputs.cache-primary-key }}
 
       - name: Upload build diagnostics
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

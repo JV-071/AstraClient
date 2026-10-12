@@ -3,8 +3,9 @@
 Dependency caches include MSVC and manifest/configuration hashes. Older caches
 seed vcpkg, which checks ABIs before reuse. Successful configuration saves new
 caches before source/test failures can discard the dependency build.
-Compiler caching uses checksum-verified sccache 0.16.0 and GitHub Actions storage,
-with GitHub-owned actions only. Cache server I/O failures allow compilation
+Compiler caching uses checksum-verified sccache 0.16.0 and a bounded local disk
+cache persisted by GitHub-owned actions. Checked-out setup code and the cache
+daemon do not receive Actions runtime credentials or the GitHub-script input token. Cache server I/O failures allow compilation
 without cache. Statistics collection cannot replace or fail successful tests.
 
 Stage logs preserve native exit codes and elapsed seconds. Diagnostics expire
@@ -25,3 +26,7 @@ Astra pins vcpkg's tool checkout in vcpkg-tool.sha separately from the manifest
 baseline. Its version database must contain the explicitly required curl 8.21
 while the baseline continues to select the other existing dependency versions.
 The tool commit also participates in the binary dependency-cache key.
+
+The build date is compiled in application.cpp instead of a widely included
+header, retaining the real compiler date without invalidating unrelated files
+when the date changes. Source optimizations and native/browser tests are unchanged.

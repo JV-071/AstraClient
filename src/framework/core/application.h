@@ -56,7 +56,7 @@ public:
 
     std::string getCharset() { return m_charset; }
     std::string getBuildCompiler() { return BUILD_COMPILER; }
-    std::string getBuildDate() { return std::string(__DATE__); }
+    std::string getBuildDate();
     std::string getBuildRevision() { return std::to_string(BUILD_REVISION); }
     std::string getBuildCommit() { return BUILD_COMMIT; }
     std::string getBuildType() { return "FULL"; }
