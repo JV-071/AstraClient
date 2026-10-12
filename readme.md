@@ -93,7 +93,7 @@ git lfs pull
 git lfs fsck
 ```
 
-The current `860.rar` payload is 79,366,040 bytes. If the downloaded file begins with `version https://git-lfs.github.com/spec/v1`, it is an LFS pointer, not the payload. Use a RAR5-capable extractor on the actual archive and extract into `data/things`, producing `860/Tibia.dat`, `860/Tibia.spr` and `860/Tibia.otfi` beneath that directory.
+If the downloaded file begins with `version https://git-lfs.github.com/spec/v1`, it is an LFS pointer, not the payload. Use a RAR5-capable extractor on the actual archive and extract into `data/things`, producing `860/Tibia.dat`, `860/Tibia.spr` and `860/Tibia.otfi` beneath that directory.
 
 ---
 
