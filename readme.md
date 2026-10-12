@@ -77,6 +77,26 @@ astraclient-windows-<commit-sha>
 
 ---
 
+## Source downloads and game assets
+
+`data/things/860.rar` is tracked with Git LFS. A source ZIP can contain a small text pointer instead of the RAR payload; that pointer cannot be extracted as an archive.
+
+For **Code > Download ZIP** to include the actual assets, a repository administrator must enable **Settings > Archives > Include Git LFS objects in archives**. This is a repository setting, so merging a code change does not enable it. See [GitHub's archive setting documentation](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/managing-repository-settings/managing-git-lfs-objects-in-archives-of-your-repository).
+
+Alternatively, install Git LFS and clone the repository:
+
+```sh
+git lfs install
+git clone https://github.com/Mateuzkl/AstraClient.git
+cd AstraClient
+git lfs pull
+git lfs fsck
+```
+
+The current `860.rar` payload is 79,366,040 bytes. If the downloaded file begins with `version https://git-lfs.github.com/spec/v1`, it is an LFS pointer, not the payload. Use a RAR5-capable extractor on the actual archive and extract into `data/things`, producing `860/Tibia.dat`, `860/Tibia.spr` and `860/Tibia.otfi` beneath that directory.
+
+---
+
 ## About AstraClient
 
 **AstraClient** is the public client identity for this project.
