@@ -592,11 +592,7 @@ function getCurrentTradeType()
 end
 
 function getItemPrice(item, single)
-  local amount = 1
-  local single = single or false
-  if not single then
-    amount = quantityScroll:getValue()
-  end
+  local amount = single and 1 or quantityScroll:getValue()
   if getCurrentTradeType() == BUY then
     if buyWithBackpack then
       if item.ptr:isStackable() then
@@ -607,6 +603,27 @@ function getItemPrice(item, single)
     end
   end
   return item.price * amount
+end
+
+local function getMaxAffordableAmount(item, budget)
+  local low, high = 0, getMaxAmount(item)
+  while low < high do
+    local amount = math.floor((low + high + 1) / 2)
+    local price = item.price * amount
+    if buyWithBackpack then
+      if item.ptr:isStackable() then
+        price = price + 20
+      else
+        price = price + math.ceil(amount / 20) * 20
+      end
+    end
+    if price <= budget then
+      low = amount
+    else
+      high = amount - 1
+    end
+  end
+  return low
 end
 
 function getSellQuantity(item, excludeEquipped)
@@ -658,11 +675,11 @@ function refreshItem(item)
   end
   local finalCount
   if getCurrentTradeType() == BUY then
-    local capacityMaxCount = item.weight > 0 and math.floor(playerFreeCapacity / item.weight) or MAX_TRADE_AMOUNT
+    local capacityMaxCount = item.weight > 0 and math.floor(playerFreeCapacity / item.weight) or getMaxAmount()
     if ignoreCapacity then
       capacityMaxCount = uint32Max
     end
-    local priceMaxCount = math.floor(getPlayerMoney() / getItemPrice(item, true))
+    local priceMaxCount = getMaxAffordableAmount(item, getPlayerMoney())
     finalCount = math.max(0, math.min(getMaxAmount(item), math.min(priceMaxCount, capacityMaxCount)))
   else
     finalCount = math.max(0, math.min(getMaxAmount(), getSellQuantity(item.ptr)))
@@ -991,6 +1008,12 @@ function formatCurrency(amount)
 end
 
 function getMaxAmount(item)
+  if getCurrentTradeType() == BUY and g_game.getFeature(GameAstraShopBuyAmountU16) then
+    return 10000
+  end
+  if getCurrentTradeType() == SELL and g_game.getFeature(GameDoubleShopSellAmount) then
+    return 10000
+  end
   return MAX_TRADE_AMOUNT
 end
 
@@ -1028,7 +1051,10 @@ local function startSellQueue(entries, notify)
   queue = NpcSellQueue.new({
     isValid = function() return tradeSession.open and tradeSession.generation == generation and g_game.isOnline() end,
     quantity = function(entry) return getSellQuantity(entry.ptr, excludeEquipped) end,
-    capped = function(entry) return playerItems[entry.ptr:getId()] == 255 end,
+    capped = function(entry)
+      return not g_game.getFeature(GameDoubleShopSellAmount) and
+        playerItems[entry.ptr:getId()] == 255
+    end,
     money = getPlayerMoney,
     sell = function(entry, amount) g_game.sellItem(entry.ptr, amount, excludeEquipped) end,
     schedule = function(callback, delay) return tradeSession:schedule(callback, delay) end,
