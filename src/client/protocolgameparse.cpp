@@ -22,6 +22,7 @@
 
 #include "protocolgame.h"
 #include "spellcooldown.h"
+#include "customitemprotocol.h"
 
 #include <algorithm>
 #include <ctime>
@@ -147,6 +148,11 @@ void ProtocolGame::parseMessage(const InputMessagePtr& msg)
     int opcodePos = 0;
     int prevOpcodePos = 0;
 
+    // Opt-in diagnostic: only large frames and movement/value opcodes are traced.
+    // A shared frame can contain several independent game opcodes.
+    const bool traceLargeFrame = g_extras.debugWalking && msg->getMessageSize() >= 900;
+    m_walkTraceBudget.beginFrame();
+
     try {
         while (!msg->eof()) {
             opcodePos = msg->getReadPos();
@@ -173,14 +179,29 @@ void ProtocolGame::parseMessage(const InputMessagePtr& msg)
                 }
             }
 
-            // try to parse in lua first
+            // Lua callbacks operate on the shared frame, not isolated packets.
+            // Log the byte range consumed so a handler skipping a later movement
+            // can be identified from the client's debugWalking output.
             int readPos = msg->getReadPos();
-            if (callLuaField<bool>("onOpcode", opcode, msg)) {
+            const bool handledByLua = callLuaField<bool>("onOpcode", opcode, msg);
+            const bool traceOpcode = g_extras.debugWalking &&
+                (traceLargeFrame || opcode == Proto::GameServerMoveCreature ||
+                 opcode == Proto::GameServerCustomItemValues ||
+                 opcode == Proto::GameServerCustomItemDetails) &&
+                m_walkTraceBudget.allow(g_clock.millis());
+            if (traceOpcode) {
+                g_logger.info(stdext::format(
+                    "[NetworkWalkTrace] ms=%lld player=%u opcode=0x%02x frame=%u start=%d afterLua=%d unread=%d lua=%d",
+                    static_cast<long long>(g_clock.millis()), m_localPlayer ? m_localPlayer->getId() : 0,
+                    opcode, msg->getMessageSize(), opcodePos, msg->getReadPos(),
+                    msg->getUnreadSize(), handledByLua ? 1 : 0));
+            }
+            if (handledByLua) {
                 prevOpcode = opcode;
                 prevOpcodePos = opcodePos;
                 continue;
-            } else
-                msg->setReadPos(readPos); // restore read pos
+            }
+            msg->setReadPos(readPos); // restore read pos before native parsing
 
             switch (opcode) {
             case Proto::GameServerCustomUnjustifiedStats:
@@ -737,6 +758,11 @@ void ProtocolGame::parseMessage(const InputMessagePtr& msg)
                 stdext::throw_exception(stdext::format("unhandled opcode %d", (int)opcode));
                 break;
             }
+            if (traceOpcode) {
+                g_logger.info(stdext::format(
+                    "[NetworkWalkTrace] ms=%lld native opcode=0x%02x end=%d unread=%d",
+                    static_cast<long long>(g_clock.millis()), opcode, msg->getReadPos(), msg->getUnreadSize()));
+            }
             prevOpcode = opcode;
             prevOpcodePos = opcodePos;
         }
@@ -1273,6 +1299,11 @@ void ProtocolGame::parseMapDescription(const InputMessagePtr& msg)
     g_map.setCentralPosition(pos);
 
     AwareRange range = g_map.getAwareRange();
+    if (g_extras.debugWalking && m_walkTraceBudget.allow(g_clock.millis())) {
+        g_logger.info(stdext::format("[NetworkWalkTrace] map center=%s aware=%dx%d viewport=%dx%d",
+            stdext::to_string(pos), range.horizontal(), range.vertical(),
+            g_gameConfig.getMapViewPort().width(), g_gameConfig.getMapViewPort().height()));
+    }
     setMapDescription(msg, pos.x - range.left, pos.y - range.top, pos.z, range.horizontal(), range.vertical());
 
     if (m_mapKnown) {
@@ -1432,6 +1463,11 @@ void ProtocolGame::parseCreatureMove(const InputMessagePtr& msg)
         stepDuration = msg->getU16();
 
     if (!thing || !thing->isCreature()) {
+        if (g_extras.debugWalking && m_walkTraceBudget.allow(g_clock.millis())) {
+            g_logger.info(stdext::format(
+                "[NetworkWalkTrace] 0x6d missing creature, destination=%s mapCenter=%s",
+                stdext::to_string(newPos), stdext::to_string(g_map.getCentralPosition())));
+        }
         g_logger.traceError("no creature found to move");
         return;
     }
@@ -4051,46 +4087,19 @@ void ProtocolGame::parseCustomItemValues(const InputMessagePtr& msg)
 
 void ProtocolGame::parseCustomItemDetails(const InputMessagePtr& msg)
 {
-    const uint16 itemId = msg->getU16();
-    const uint32 defaultValue = msg->getU32();
-    const uint32 defaultBuyPrice = msg->getU32();
-    const uint32 averageMarketValue = msg->getU32();
+    const auto data = CustomItemProtocol::readDetails(*msg);
+    const auto& [itemId, defaultValue, defaultBuyPrice, averageMarketValue, descriptions, npcSaleData] = data;
 
-    std::vector<std::pair<std::string, std::string>> descriptions;
-    const uint8 descriptionCount = msg->getU8();
-    descriptions.reserve(descriptionCount);
-    for (uint8 i = 0; i < descriptionCount; ++i) {
-        descriptions.emplace_back(msg->getString(), msg->getString());
-    }
-
-    std::vector<std::tuple<std::string, std::string, uint32, uint32, std::string>> npcSaleData;
-    const uint16 npcCount = msg->getU16();
-    npcSaleData.reserve(npcCount);
-    for (uint16 i = 0; i < npcCount; ++i) {
-        auto npcName = msg->getString();
-        auto location = msg->getString();
-        const uint32 buyPrice = msg->getU32();
-        const uint32 salePrice = msg->getU32();
-        auto currencyQuestFlagDisplayName = msg->getString();
-        npcSaleData.emplace_back(npcName, location, buyPrice, salePrice, currencyQuestFlagDisplayName);
-    }
-
+    // The TFS 8.60 ItemDetails wire format ends after npcSaleData.
+    // There is no unframed optional string: the next bytes are another opcode.
     std::string itemName;
-    if (msg->getUnreadSize() >= 2 && msg->peekU16() + 2 <= msg->getUnreadSize()) {
-        itemName = msg->getString();
-    }
-    if (itemName.empty()) {
-        for (const auto& [detail, description] : descriptions) {
-            std::string lowerDetail = detail;
-            stdext::tolower(lowerDetail);
-            if (lowerDetail == "name") {
-                itemName = description;
-                break;
-            }
+    for (const auto& [detail, description] : descriptions) {
+        std::string lowerDetail = detail;
+        stdext::tolower(lowerDetail);
+        if (lowerDetail == "name") {
+            itemName = description;
+            break;
         }
-    }
-    if (msg->getUnreadSize() > 0) {
-        msg->skipBytes(msg->getUnreadSize());
     }
 
     g_lua.getGlobalField("ItemsDatabase", "registerServerItemDetails");
@@ -4873,6 +4882,15 @@ ThingPtr ProtocolGame::getMappedThing(const InputMessagePtr& msg)
 
         VALIDATE(stackpos != 255);
         thing = g_map.getThing(pos, stackpos);
+        if (g_extras.debugWalking && m_walkTraceBudget.allow(g_clock.millis())) {
+            const auto tile = g_map.getTile(pos);
+            g_logger.info(stdext::format(
+                "[NetworkWalkTrace] mapped pos=%s stack=%u found=%d things=%u creature=%u center=%s",
+                stdext::to_string(pos), stackpos, thing ? 1 : 0,
+                tile ? static_cast<unsigned>(tile->getThings().size()) : 0,
+                thing && thing->isCreature() ? thing->static_self_cast<Creature>()->getId() : 0,
+                stdext::to_string(g_map.getCentralPosition())));
+        }
         if (!thing)
             g_logger.traceError(stdext::format("no thing at pos:%s, stackpos:%d", stdext::to_string(pos), stackpos));
     } else {
