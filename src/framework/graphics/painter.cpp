@@ -354,6 +354,9 @@ void Painter::updateGlCompositionMode()
     case CompositionMode_Normal:
         glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
         break;
+    case CompositionMode_Premultiplied:
+        glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        break;
     case CompositionMode_Multiply:
         glBlendFunc(GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA);
         break;
@@ -758,32 +761,6 @@ void Painter::drawLine(const std::vector<float>& vertex, int size, int width)
 
     m_draws += size;
     m_calls += 1;
-}
-
-void Painter::setAtlasTextures(const TexturePtr& atlas)
-{
-    static uint activeTexture = 0;
-    if (activeTexture == atlas->getId())
-        return;
-    activeTexture = atlas ? atlas->getId() : 0;
-    glActiveTexture(GL_TEXTURE6); // atlas
-    glBindTexture(GL_TEXTURE_2D, activeTexture);
-    if (atlas)
-        m_atlasTextureMatrix = atlas->getTransformMatrix();
-    glActiveTexture(GL_TEXTURE0);
-}
-
-void Painter::setSecondTexture(const TexturePtr& texture)
-{
-    static uint activeTexture = 0;
-    if (texture)
-        texture->update();
-    if (activeTexture == texture->getId())
-        return;
-    activeTexture = texture ? texture->getId() : 0;
-    glActiveTexture(GL_TEXTURE1); // u_Tex1
-    glBindTexture(GL_TEXTURE_2D, activeTexture);
-    glActiveTexture(GL_TEXTURE0);
 }
 
 void Painter::setOffset(const Point& offset)

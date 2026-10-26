@@ -1,4 +1,10 @@
+---Build an isolated bot context and its tick/event entry points.
+---The caller supplies UI tabs and message, persistence and reload callbacks.
 function executeBot(config, storage, tabs, msgCallback, saveConfigCallback, reloadCallback, websockets, applyBotFontsCallback)
+  ---Compile source with the bot environment, retaining Lua 5.1 compatibility.
+  ---@param source string
+  ---@param name string|nil
+  ---@param environment table
   local function compileInContext(source, name, environment)
     local chunk, compileError = loadstring(source, name)
     if chunk then
@@ -179,6 +185,7 @@ function executeBot(config, storage, tabs, msgCallback, saveConfigCallback, relo
   end
 
   return {
+    ---Run macros, then process only the current scheduler generation.
     script = function()
       local now = g_clock.millis()
       context.now = now
@@ -196,12 +203,29 @@ function executeBot(config, storage, tabs, msgCallback, saveConfigCallback, relo
         end
       end
 
-      while #context._scheduler > 0 and context._scheduler[1].execution <= g_clock.millis() do
-        local task = table.remove(context._scheduler, 1)
-        local status, result = pcall(task.callback)
-        context._currentExecution = nil
-        if not status then
-          context.error("Schedule execution error: " .. result)
+      -- New tasks wait for the next generation. Inspect only the due prefix;
+      -- the queue may also contain a large backlog of future work.
+      if #context._scheduler > 0 and context._scheduler[1].execution <= g_clock.millis() then
+        local generation = context._schedulerGeneration or 0
+        context._schedulerGeneration = generation + 1
+        local index = 1
+        while index <= #context._scheduler do
+          local task = context._scheduler[index]
+          if task.execution > g_clock.millis() then
+            break
+          end
+          if (task.generation or 0) <= generation then
+            table.remove(context._scheduler, index)
+            local status, result = pcall(task.callback)
+            context._currentExecution = nil
+            if not status then
+              context.error("Schedule execution error: " .. result)
+            end
+            -- A callback can insert new tasks before any remaining old task.
+            index = 1
+          else
+            index = index + 1
+          end
         end
       end
     end,

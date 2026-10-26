@@ -44,6 +44,10 @@
 #include <framework/util/stats.h>
 #include <mutex>
 #include <array>
+#include <utility>
+#ifdef FW_RMLUI
+#include <framework/rml/rmlmanager.h>
+#endif
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
@@ -87,6 +91,38 @@ std::unique_ptr<BrowserRunState> browserRunState;
 #endif
 
 namespace {
+    // Only touched by the graphics thread. Never read a discarded back buffer
+    // from pollGraphics(): capture the completed frame immediately before swap.
+    std::vector<std::string> pendingScreenshots;
+    constexpr size_t MAX_PENDING_SCREENSHOTS = 16;
+
+    void capturePendingScreenshots()
+    {
+        if (pendingScreenshots.empty())
+            return;
+        auto files = std::exchange(pendingScreenshots, {});
+        const auto resolution = g_graphics.getViewportSize();
+        const int width = resolution.width(), height = resolution.height();
+        if (width <= 0 || height <= 0)
+            return;
+        auto pixels = std::make_shared<std::vector<uint8_t>>(size_t(width) * size_t(height) * 4);
+        glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels->data());
+        g_asyncDispatcher.dispatch([resolution, pixels, files = std::move(files)] {
+            for (int line = 0, h = resolution.height(), w = resolution.width(); line < h / 2; ++line) {
+                std::swap_ranges(pixels->begin() + 4 * w * line, pixels->begin() + 4 * w * (line + 1),
+                    pixels->begin() + 4 * w * (h - line - 1));
+            }
+            Image image(resolution, 4, pixels->data());
+            for (const auto& file : files) {
+                try {
+                    image.savePNG(file);
+                } catch (const stdext::exception& e) {
+                    g_logger.error(std::string("Can't do screenshot: ") + e.what());
+                }
+            }
+        });
+    }
+
     // Fallback FPS used when VSync is requested but could not be applied by the driver.
     // This prevents an unbounded render loop when swapBuffers() does not block.
     constexpr int VSYNC_FALLBACK_FPS = 100;
@@ -214,8 +250,12 @@ void GraphicalApplication::finishStartup()
 
 void GraphicalApplication::terminate()
 {
+    pendingScreenshots.clear();
     // destroy any remaining widget
     g_ui.terminate();
+#ifdef FW_RMLUI
+    g_rml.terminate();
+#endif
 
     Application::terminate();
     m_terminated = false;
@@ -353,7 +393,7 @@ void GraphicalApplication::browserMainLoop()
     const bool visible = g_window.isVisible();
     const bool focused = g_window.hasFocus();
     const ticks_t now = stdext::micros();
-    if (!visible) {
+    if (!visible && pendingScreenshots.empty()) {
         state.telemetryPreviousFrame = 0;
         if (now - state.lastRender >= frameDelayForCap(HIDDEN_FPS)) {
             g_adaptiveRenderer.refresh();
@@ -372,13 +412,13 @@ void GraphicalApplication::browserMainLoop()
     const ticks_t renderStart = stdext::millis();
     {
         AutoStat stat(STATS_MAIN, "DrawMapBackground");
-        g_drawQueue = std::make_shared<DrawQueue>();
+        g_drawQueue = std::make_shared<DrawQueue>(m_drawCommandPooling.load());
         g_ui.render(Fw::MapBackgroundPane);
         state.toDrawMapQueue = g_drawQueue;
     }
     {
         AutoStat stat(STATS_MAIN, "DrawMapForeground");
-        g_drawQueue = std::make_shared<DrawQueue>();
+        g_drawQueue = std::make_shared<DrawQueue>(m_drawCommandPooling.load());
         g_ui.render(Fw::MapForegroundPane);
         state.toDrawMapForegroundQueue = g_drawQueue;
     }
@@ -387,7 +427,7 @@ void GraphicalApplication::browserMainLoop()
         || now - state.uiBuildLast >= (visualDelay > 0 ? visualDelay : UI_UPDATE_INTERVAL_US);
     if (buildForeground) {
         AutoStat stat(STATS_MAIN, "DrawForeground");
-        g_drawQueue = std::make_shared<DrawQueue>();
+        g_drawQueue = std::make_shared<DrawQueue>(m_drawCommandPooling.load());
         g_ui.render(Fw::ForegroundPane);
         state.toDrawQueue = g_drawQueue;
         state.uiBuildLast = now;
@@ -505,6 +545,7 @@ void GraphicalApplication::browserMainLoop()
 
     g_graphs[GRAPH_GPU_CALLS].addValue(g_painter->calls());
     g_graphs[GRAPH_GPU_DRAWS].addValue(g_painter->draws());
+    capturePendingScreenshots();
     {
         AutoStat stat(STATS_RENDER, "SwapBuffers");
         g_window.swapBuffers();
@@ -651,14 +692,14 @@ void GraphicalApplication::run()
                 std::shared_ptr<DrawQueue> mapBackgroundQueue;
                 {
                     AutoStat s(STATS_MAIN, "DrawMapBackground");
-                    g_drawQueue = std::make_shared<DrawQueue>();
+                    g_drawQueue = std::make_shared<DrawQueue>(m_drawCommandPooling.load());
                     g_ui.render(Fw::MapBackgroundPane);
                     mapBackgroundQueue = g_drawQueue;
                 }
                 std::shared_ptr<DrawQueue> mapForegroundQueue;
                 {
                     AutoStat s(STATS_MAIN, "DrawMapForeground");
-                    g_drawQueue = std::make_shared<DrawQueue>();
+                    g_drawQueue = std::make_shared<DrawQueue>(m_drawCommandPooling.load());
                     g_ui.render(Fw::MapForegroundPane);
                     mapForegroundQueue = g_drawQueue;
                 }
@@ -681,7 +722,7 @@ void GraphicalApplication::run()
                 std::shared_ptr<DrawQueue> foregroundQueue;
                 {
                     AutoStat s(STATS_MAIN, "DrawForeground");
-                    g_drawQueue = std::make_shared<DrawQueue>();
+                    g_drawQueue = std::make_shared<DrawQueue>(m_drawCommandPooling.load());
                     g_ui.render(Fw::ForegroundPane);
                     foregroundQueue = g_drawQueue;
                 }
@@ -717,8 +758,15 @@ void GraphicalApplication::run()
         const bool visible = g_window.isVisible();
         const bool focused = g_window.hasFocus();
 
+        // A surface can disappear after a screenshot was queued but before this frame.
+#ifdef ANDROID
+        if (!visible && !pendingScreenshots.empty()) {
+            pendingScreenshots.clear();
+            g_logger.warning("Cancelled pending screenshots because the Android surface was destroyed");
+        }
+#endif
         // Even when invisible we need to keep processing graphics events and avoid busy waiting.
-        if (!visible) {
+        if (!visible && pendingScreenshots.empty()) {
             AutoStat s(STATS_RENDER, "Sleep");
             const int cap = HIDDEN_FPS;
             const ticks_t delay = frameDelayForCap(cap);
@@ -879,6 +927,7 @@ void GraphicalApplication::run()
         g_graphs[GRAPH_GPU_CALLS].addValue(g_painter->calls());
         g_graphs[GRAPH_GPU_DRAWS].addValue(g_painter->draws());
 
+        capturePendingScreenshots();
         AutoStat s(STATS_RENDER, "SwapBuffers");
         g_window.swapBuffers();
 #if defined(WIN32) && !defined(__EMSCRIPTEN__)
@@ -955,29 +1004,20 @@ void GraphicalApplication::doScreenshot(std::string file)
         return;
     }
 
-    if (file.empty()) {
-        file = "screenshot.png";
+#ifdef ANDROID
+    // A paused NativeActivity may have destroyed its EGL surface. Never keep a
+    // request until resume and silently save a different game/event instead.
+    if (!g_window.isVisible()) {
+        g_logger.warning("Cannot capture screenshot while the Android surface is unavailable");
+        return;
     }
-    auto resolution = g_graphics.getViewportSize();
-    int width = resolution.width();
-    int height = resolution.height();
-    auto pixels = std::make_shared<std::vector<uint8_t>>(width * height * 4 * sizeof(GLubyte), 0);
-    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, (GLubyte*)(pixels->data()));
+#endif
 
-    g_asyncDispatcher.dispatch([resolution, pixels, file] {
-        for (int line = 0, h = resolution.height(), w = resolution.width(); line != h / 2; ++line) {
-            std::swap_ranges(
-                pixels->begin() + 4 * w * line,
-                pixels->begin() + 4 * w * (line + 1),
-                pixels->begin() + 4 * w * (h - line - 1));
-        }
-        try {
-            Image image(resolution, 4, pixels->data());
-            image.savePNG(file);
-        } catch (stdext::exception& e) {
-            g_logger.error(std::string("Can't do screenshot: ") + e.what());
-        }
-    });
+    if (pendingScreenshots.size() >= MAX_PENDING_SCREENSHOTS) {
+        g_logger.warning("Too many pending screenshots; wait for the next rendered frame");
+        return;
+    }
+    pendingScreenshots.push_back(file.empty() ? "screenshot.png" : std::move(file));
 }
 
 void GraphicalApplication::scaleUp()

@@ -17,6 +17,7 @@ on:
       - refactor/**
     paths:
       - .github/workflows/build-vcpkg.yml
+      - tests/cpp23/**
       - cmake/**
       - src/**
       - tests/spectators/**
@@ -29,9 +30,13 @@ on:
       - data/images/splash.png
       - data/cursors/**
       - vc23/otclient.vcxproj
+      - vc23/RmlUi.targets
+      - tests/rmlui/**
+      - tests/rendering/**
   pull_request:
     paths:
       - .github/workflows/build-vcpkg.yml
+      - tests/cpp23/**
       - cmake/**
       - src/**
       - tests/spectators/**
@@ -44,6 +49,9 @@ on:
       - data/images/splash.png
       - data/cursors/**
       - vc23/otclient.vcxproj
+      - vc23/RmlUi.targets
+      - tests/rmlui/**
+      - tests/rendering/**
 
 jobs:
   build-windows:
@@ -66,6 +74,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Validate Visual Studio GL and ANGLE settings
+        shell: pwsh
+        run: ./tests/rmlui/msbuild.ps1
+
+      - name: Test live-session JSON encoding on Windows PowerShell
+        shell: powershell
+        run: ./tests/cpp23/Test-LiveSessionEncoding.ps1
 
       - name: Read build context
         shell: pwsh
@@ -159,17 +175,56 @@ jobs:
           ctest --test-dir build -C Release --output-on-failure --no-tests=error
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Prepare isolated software OpenGL for headless Windows tests
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'mesa3d-26.2.4-release-msvc.7z'
+          $runtime = Join-Path $env:RUNNER_TEMP 'astra-mesa-tests'
+          Invoke-WebRequest 'https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z' -OutFile $archive
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne '351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695') {
+            throw 'Mesa test runtime checksum mismatch.'
+          }
+          & 7z x $archive "-o$runtime" 'x64/opengl32.dll' 'x64/libgallium_wgl.dll' '-y'
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to extract Mesa test runtime.' }
+          "ASTRA_TEST_OPENGL_RUNTIME=$runtime\x64" >> $env:GITHUB_ENV
+
+      - name: Test OpenGL rendering and widget lifetimes
+        shell: pwsh
+        env:
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          ./tests/rmlui/run-smoke.ps1 -Binary build/AstraClient.exe -TempRoot build/diagnostics -GraphicsRuntimeDir $env:ASTRA_TEST_OPENGL_RUNTIME
+          ./tests/rmlui/run-smoke.ps1 -Binary build/AstraClient.exe -TempRoot build/diagnostics -GraphicsRuntimeDir $env:ASTRA_TEST_OPENGL_RUNTIME -Scenario skilltree
+
+      - name: Build actual DirectX ANGLE client
+        shell: pwsh
+        run: |
+          $commands = @'
+          cmake -B build-angle -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_TOOLCHAIN_FILE=%GITHUB_WORKSPACE%\vcpkg\scripts\buildsystems\vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static -DVCPKG_MANIFEST_MODE=OFF -DVCPKG_INSTALLED_DIR=%GITHUB_WORKSPACE%\build\vcpkg_installed -DOPENGLES=2.0 -DBUILD_TESTING=OFF
+          if errorlevel 1 exit /b 1
+          cmake --build build-angle --target AstraClient --parallel 2
+          if errorlevel 1 exit /b 1
+          '@
+          & ./cmake/ci/InvokeBuildStage.ps1 -Name 'Build-ANGLE' -CmdScript $commands
+
+      - name: Test DirectX ANGLE rendering and widget lifetimes
+        shell: pwsh
+        run: |
+          ./tests/rmlui/run-smoke.ps1 -Binary build-angle/AstraClient.exe -TempRoot build/diagnostics -GraphicsBackend '-warp'
+          ./tests/rmlui/run-smoke.ps1 -Binary build-angle/AstraClient.exe -TempRoot build/diagnostics -GraphicsBackend '-warp' -Scenario skilltree
+
       - name: test-standalone-utilities-and-native-networking
         shell: pwsh
         run: |
           $commands = @'
           if errorlevel 1 exit /b 1
           mkdir build\network-test
-          cl /nologo /O2 /MT /Gy /std:c++17 /EHsc /DNDEBUG /DWIN32 /DNOMINMAX /DASIO_STANDALONE /DCURL_STATICLIB /D_WIN32_WINNT=0x0601 /Isrc /Ibuild\vcpkg_installed\x64-windows-static\include /Fe:build\network-test\utilities.exe /Fo:build\network-test\ .github\tests\standalone_util.cpp src\framework\stdext\string.cpp /link /OPT:REF ws2_32.lib
+          cl /nologo /O2 /MT /Gy /std:c++23preview /Zc:__cplusplus /FIframework/stdext/cxx23.h /EHsc /DNDEBUG /DWIN32 /DNOMINMAX /DASIO_STANDALONE /DCURL_STATICLIB /D_WIN32_WINNT=0x0601 /Isrc /Ibuild\vcpkg_installed\x64-windows-static\include /Fe:build\network-test\utilities.exe /Fo:build\network-test\ .github\tests\standalone_util.cpp src\framework\stdext\string.cpp /link /OPT:REF ws2_32.lib
           if errorlevel 1 exit /b 1
           build\network-test\utilities.exe
           if errorlevel 1 exit /b 1
-          cl /nologo /O2 /MT /std:c++17 /EHsc /DNDEBUG /DWIN32 /DNOMINMAX /DASIO_STANDALONE /DCURL_STATICLIB /D_WIN32_WINNT=0x0601 /Isrc /Ibuild\vcpkg_installed\x64-windows-static\include /Fe:build\network-test\network.exe /Fo:build\network-test\ .github\tests\native_network.cpp src\framework\http\session.cpp src\framework\http\websocket.cpp /link /LIBPATH:build\vcpkg_installed\x64-windows-static\lib libcurl.lib zlib.lib libssl.lib libcrypto.lib ws2_32.lib crypt32.lib bcrypt.lib user32.lib advapi32.lib secur32.lib iphlpapi.lib
+          cl /nologo /O2 /MT /std:c++23preview /Zc:__cplusplus /FIframework/stdext/cxx23.h /EHsc /DNDEBUG /DWIN32 /DNOMINMAX /DASIO_STANDALONE /DCURL_STATICLIB /D_WIN32_WINNT=0x0601 /Isrc /Ibuild\vcpkg_installed\x64-windows-static\include /Fe:build\network-test\network.exe /Fo:build\network-test\ .github\tests\native_network.cpp src\framework\http\session.cpp src\framework\http\websocket.cpp /link /LIBPATH:build\vcpkg_installed\x64-windows-static\lib libcurl.lib zlib.lib libssl.lib libcrypto.lib ws2_32.lib crypt32.lib bcrypt.lib user32.lib advapi32.lib secur32.lib iphlpapi.lib
           if errorlevel 1 exit /b 1
           node .github\tests\native_network_fixture.cjs build\network-test\network.exe build\network-test
           if errorlevel 1 exit /b 1
@@ -184,7 +239,7 @@ jobs:
           mkdir build\native-splash-test\data\images
           copy /y data\images\splash.png build\native-splash-test\data\images\splash.png
           if errorlevel 1 exit /b 1
-          cl /nologo /O2 /MT /utf-8 /std:c++17 /EHsc /DNDEBUG /DWIN32 /Ibuild\vcpkg_installed\x64-windows-static\include /Fe:build\native-splash-test\native-splash-test.exe /Fo:build\native-splash-test\ .github\tests\native_splash.cpp src\framework\platform\nativesplash.cpp src\framework\graphics\apngloader.cpp /link gdiplus.lib user32.lib gdi32.lib build\vcpkg_installed\x64-windows-static\lib\zlib.lib
+          cl /nologo /O2 /MT /utf-8 /std:c++23preview /Zc:__cplusplus /FIframework/stdext/cxx23.h /EHsc /DNDEBUG /DWIN32 /Isrc /Ibuild\vcpkg_installed\x64-windows-static\include /Fe:build\native-splash-test\native-splash-test.exe /Fo:build\native-splash-test\ .github\tests\native_splash.cpp src\framework\platform\nativesplash.cpp src\framework\graphics\apngloader.cpp /link gdiplus.lib user32.lib gdi32.lib build\vcpkg_installed\x64-windows-static\lib\zlib.lib
           if errorlevel 1 exit /b 1
           build\native-splash-test\native-splash-test.exe "%GITHUB_WORKSPACE%\data\cursors"
           if errorlevel 1 exit /b 1
@@ -239,7 +294,10 @@ jobs:
           name: windows-diagnostics-${{ github.sha }}
           path: |
             build/diagnostics/
+            build-angle/CMakeCache.txt
+            build-angle/CMakeFiles/CMakeConfigureLog.yaml
             build/CMakeCache.txt
+            build/compile_commands.json
             build/CMakeFiles/CMakeConfigureLog.yaml
             build/Testing/Temporary/
             build/vcpkg-manifest-install.log
