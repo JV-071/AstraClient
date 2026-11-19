@@ -58,9 +58,12 @@ jobs:
         id: identity
         run: |
           mkdir -p .cache/vcpkg .cache/downloads .cache/ccache
-          baseline="$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")"
+          # The vcpkg checkout is the commit pinned in cmake/ci/vcpkg-tool.sha (the same one the
+          # Windows build uses): it is newer than the builtin-baseline of vcpkg.json and knows the
+          # versions the manifest asks for (curl >= 8.21.0); the baseline itself stays in vcpkg.json.
+          vcpkg_commit="$(tr -d '[:space:]' < cmake/ci/vcpkg-tool.sha)"
           compiler="$(g++-14 -dumpfullversion)"
-          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "vcpkg_commit=$vcpkg_commit" >> "$GITHUB_OUTPUT"
           echo "compiler=$compiler" >> "$GITHUB_OUTPUT"
           echo "runner=$ImageOS/$ImageVersion  g++ $compiler  $(cmake --version | head -1)  ninja $(ninja --version)  cores=$(nproc)"
           ldd --version | head -1
@@ -70,7 +73,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .cache/vcpkg
-          key: deps-v1-linux-${{ env.TRIPLET }}-gcc${{ steps.identity.outputs.compiler }}-${{ hashFiles('vcpkg.json') }}
+          key: deps-v1-linux-${{ env.TRIPLET }}-gcc${{ steps.identity.outputs.compiler }}-${{ hashFiles('vcpkg.json', 'cmake/ci/vcpkg-tool.sha') }}
           restore-keys: |
             deps-v1-linux-${{ env.TRIPLET }}-gcc${{ steps.identity.outputs.compiler }}-
 
@@ -83,11 +86,11 @@ jobs:
           restore-keys: |
             ccache-v1-linux-release-gcc${{ steps.identity.outputs.compiler }}-
 
-      - name: Checkout vcpkg at the manifest baseline
+      - name: Checkout pinned vcpkg
         uses: actions/checkout@v4
         with:
           repository: microsoft/vcpkg
-          ref: ${{ steps.identity.outputs.baseline }}
+          ref: ${{ steps.identity.outputs.vcpkg_commit }}
           path: .ci/vcpkg
           persist-credentials: false
           fetch-depth: 0
