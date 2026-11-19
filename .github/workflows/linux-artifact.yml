@@ -1,0 +1,191 @@
+name: Linux artifact
+
+# Linux x86_64 release build of the client, delivered as a downloadable artifact.
+#
+#  - the build documented in readme.md (plain CMake + vcpkg toolchain), as a Release build with
+#    Ninja, gcc-14 and release-only static dependencies (triplet x64-linux-release)
+#  - built on ubuntu-24.04 (glibc 2.39): runs on that or anything newer (e.g. Debian 13)
+#  - vcpkg dependencies come from a binary cache kept with actions/cache; it is saved right
+#    after configure, so a compile error never throws the dependency build away
+#  - compiler objects go through ccache, so a retry after a source error recompiles only
+#    what changed; the build keeps going after errors to show all of them in one run
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/linux-build
+
+permissions:
+  contents: read
+
+env:
+  CC: gcc-14
+  CXX: g++-14
+  TRIPLET: x64-linux-release
+  VCPKG_DISABLE_METRICS: "1"
+  VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.cache/vcpkg,readwrite
+  VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/downloads
+  CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
+  CCACHE_MAXSIZE: 1G
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_NOHASHDIR: "true"
+
+jobs:
+  build:
+    name: linux-x86_64-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install compiler and system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-14 g++-14 build-essential cmake ninja-build ccache pkg-config \
+            autoconf autoconf-archive automake libtool libtool-bin libltdl-dev m4 nasm perl \
+            curl zip unzip tar ca-certificates git linux-libc-dev python3 \
+            libgl1-mesa-dev libglu1-mesa-dev libx11-dev libxrandr-dev libxi-dev libxmu-dev \
+            libxcursor-dev libxinerama-dev libxext-dev libasound2-dev libpulse-dev
+
+      - name: Build identity
+        id: identity
+        run: |
+          mkdir -p .cache/vcpkg .cache/downloads .cache/ccache
+          baseline="$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")"
+          compiler="$(g++-14 -dumpfullversion)"
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "compiler=$compiler" >> "$GITHUB_OUTPUT"
+          echo "runner=$ImageOS/$ImageVersion  g++ $compiler  $(cmake --version | head -1)  ninja $(ninja --version)  cores=$(nproc)"
+          ldd --version | head -1
+
+      - name: Restore vcpkg dependencies
+        id: dependencies
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/vcpkg
+          key: deps-v1-linux-${{ env.TRIPLET }}-gcc${{ steps.identity.outputs.compiler }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            deps-v1-linux-${{ env.TRIPLET }}-gcc${{ steps.identity.outputs.compiler }}-
+
+      - name: Restore compiler cache
+        id: compiler
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/ccache
+          key: ccache-v1-linux-release-gcc${{ steps.identity.outputs.compiler }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-v1-linux-release-gcc${{ steps.identity.outputs.compiler }}-
+
+      - name: Checkout vcpkg at the manifest baseline
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ steps.identity.outputs.baseline }}
+          path: .ci/vcpkg
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Bootstrap vcpkg
+        run: |
+          ./.ci/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          echo "VCPKG_ROOT=$GITHUB_WORKSPACE/.ci/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Configure
+        id: configure
+        run: |
+          ccache --zero-stats > /dev/null
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=${{ env.TRIPLET }} \
+            -DVCPKG_HOST_TRIPLET=${{ env.TRIPLET }} \
+            -DOPTIONS_ENABLE_CCACHE=ON \
+            -DBUILD_TESTING=OFF
+
+      # Saved before compiling: a source error must not discard the dependency build.
+      - name: Save vcpkg dependencies
+        if: ${{ !cancelled() && steps.configure.outcome == 'success' && steps.dependencies.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/vcpkg
+          key: ${{ steps.dependencies.outputs.cache-primary-key }}
+
+      - name: Build
+        run: |
+          set -o pipefail
+          # -k 0: keep going after errors, so one run shows every file that does not compile
+          cmake --build build --target AstraClient --parallel "$(nproc)" -- -k 0 2>&1 | tee build.log
+
+      - name: Errors
+        if: ${{ failure() }}
+        run: |
+          if [ -f build.log ]; then
+            echo "::group::compile and link errors"
+            grep -nE "error:|Error |undefined reference|cannot find|FAILED:|ld returned" build.log | sort -t: -k2 -u | head -300 || true
+            echo "::endgroup::"
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          binary=build/AstraClient
+          test -x "$binary"
+          mkdir -p package
+          cp "$binary" package/AstraClient
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "ref=$GITHUB_REF"
+            echo "runner=$ImageOS/$ImageVersion"
+            echo "compiler=g++ $(g++-14 -dumpfullversion)"
+            echo "glibc_build=$(ldd --version | head -1)"
+            echo "glibc_required=$(objdump -T "$binary" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+            echo "glibcxx_required=$(objdump -T "$binary" | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -1)"
+            file "$binary"
+            echo "--- ldd on the runner"
+            ldd "$binary"
+          } | tee package/build-info.txt
+          # a tarball keeps the executable bit (artifact zips do not)
+          tar -czf AstraClient-linux-x86_64.tar.gz -C package .
+          ls -lh AstraClient-linux-x86_64.tar.gz package/
+
+      - name: Upload client binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: AstraClient-linux-x86_64
+          path: AstraClient-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: ccache --show-stats || true
+
+      # Also after a failed build: the objects that did compile are reused by the next run.
+      - name: Save compiler cache
+        if: ${{ !cancelled() && steps.configure.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/ccache
+          key: ${{ steps.compiler.outputs.cache-primary-key }}
+
+      - name: Upload diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-linux-${{ github.run_attempt }}
+          path: |
+            build.log
+            build/CMakeCache.txt
+            build/vcpkg-manifest-install.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            .ci/vcpkg/buildtrees/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
