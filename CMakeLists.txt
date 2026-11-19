@@ -9,6 +9,20 @@ endif()
 
 include(cmake/AstraCxx23.cmake)
 
+# ccache opcional (desligado por padrao): -DOPTIONS_ENABLE_CCACHE=ON
+option(OPTIONS_ENABLE_CCACHE "Usa o ccache, se estiver instalado, para nao recompilar o que nao mudou" OFF)
+if(OPTIONS_ENABLE_CCACHE AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+    find_program(ASTRA_CCACHE ccache)
+    if(ASTRA_CCACHE)
+        set(CMAKE_C_COMPILER_LAUNCHER ${ASTRA_CCACHE})
+        set(CMAKE_CXX_COMPILER_LAUNCHER ${ASTRA_CCACHE})
+        message(STATUS "ccache: ${ASTRA_CCACHE}")
+    endif()
+endif()
+
+# limite de compilacoes simultaneas pela RAM (desligado por padrao): -DOPTIONS_LOW_MEMORY_BUILD=ON
+include(cmake/BuildTuning.cmake)
+
 # default build type
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release")

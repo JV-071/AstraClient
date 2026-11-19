@@ -1,0 +1,42 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "linux-local",
+      "displayName": "Linux - PC de desenvolvimento (pouca RAM)",
+      "description": "Release, dependencias pelo vcpkg (VCPKG_ROOT), mold, ccache e compilacoes simultaneas pela RAM",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": {
+          "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+          "type": "FILEPATH"
+        },
+        "VCPKG_TARGET_TRIPLET": "x64-linux-release",
+        "VCPKG_HOST_TRIPLET": "x64-linux-release",
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_FLAGS": "--param ggc-min-expand=20 --param ggc-min-heapsize=32768",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=mold",
+        "OPTIONS_ENABLE_CCACHE": "ON",
+        "OPTIONS_LOW_MEMORY_BUILD": "ON",
+        "USE_LTO": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "linux-local",
+      "configurePreset": "linux-local"
+    }
+  ]
+}
